@@ -1,0 +1,18 @@
+node_modules/
+dist/
+deploy/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data (user uploads live on the server, Passenger restart flag)
+uploads/
+tmp/
+
+*.log
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
