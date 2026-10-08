@@ -19,6 +19,7 @@ const COLUMN_MIGRATIONS = [
     'ALTER TABLE `bookings` ADD COLUMN `hourly_rate` DECIMAL(10,2) NULL DEFAULT NULL',
     'ALTER TABLE `quote_leads` ADD COLUMN `admin_notes` TEXT NULL',
     'ALTER TABLE `customer_invoices` ADD COLUMN `admin_notes` TEXT NULL',
+    'ALTER TABLE `bookings` ADD COLUMN `arrived_at` TIMESTAMP NULL DEFAULT NULL',
     'ALTER TABLE `quote_leads` ADD COLUMN `status_updated_at` TIMESTAMP NULL DEFAULT NULL',
 ];
 
@@ -35,6 +36,18 @@ const ON_COLUMN_CREATED: Record<string, string[]> = {
 
 /** Tables added after first deploy (created only if missing). */
 const TABLE_MIGRATIONS = [
+    `CREATE TABLE IF NOT EXISTS \`push_tokens\` (
+        \`id\` INT NOT NULL AUTO_INCREMENT,
+        \`user_id\` INT NOT NULL,
+        \`token\` VARCHAR(255) NOT NULL,
+        \`platform\` VARCHAR(20) NOT NULL,
+        \`created_at\` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        \`last_seen_at\` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (\`id\`),
+        UNIQUE KEY \`push_tokens_token_unique\` (\`token\`),
+        KEY \`push_tokens_user_idx\` (\`user_id\`),
+        CONSTRAINT \`push_tokens_user_id_users_id_fk\` FOREIGN KEY (\`user_id\`) REFERENCES \`users\` (\`id\`) ON DELETE CASCADE
+    )`,
     `CREATE TABLE IF NOT EXISTS \`staff_assessments\` (
         \`id\` INT NOT NULL AUTO_INCREMENT,
         \`staff_id\` INT NOT NULL,

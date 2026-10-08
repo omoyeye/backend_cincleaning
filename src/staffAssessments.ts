@@ -2,6 +2,7 @@ import type { Express } from 'express';
 import { desc, eq, inArray } from 'drizzle-orm';
 import { bookingStaff, bookings, notifications, staff, staffAssessments, superadmins, users } from './schema';
 import { broadcastSync } from './realtime';
+import { pushUsers } from './notify';
 
 type Auth = (req: any, res: any, next: any) => void;
 
@@ -125,6 +126,7 @@ export function registerStaffAssessmentRoutes(app: Express, db: any, authenticat
                     message: `New on-the-job assessment from ${assessorName}: ${rating}/5. "${remark.slice(0, 120)}${remark.length > 120 ? '...' : ''}"`,
                     isRead: false,
                 });
+                pushUsers([Number(target.userId)], 'New assessment from ' + assessorName, rating + '/5: ' + remark.slice(0, 120), { type: 'assessment' });
                 broadcastSync('notifications');
             }
             res.status(201).json({ id: created.id });

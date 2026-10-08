@@ -7,6 +7,7 @@ import { sendEmail } from './services/email';
 import { interpolateTemplate, wrapHtmlInEmailShell } from './messageTemplates/engine';
 import { adminBookingNotifyEmail, loadBrandVars, loadBusinessSettingsMap } from './messageTemplates/brand';
 import { sendPushToUsers } from './push';
+import { notifyUsers } from './notify';
 
 type BookingRow = typeof bookings.$inferSelect;
 type StaffRow = typeof staff.$inferSelect;
@@ -210,6 +211,48 @@ export function registerJobTrackingRoutes(
     authenticateToken: (req: any, res: any, next: any) => void,
     requireAdmin: (req: any, res: any) => boolean,
 ): void {
+    // Cleaner clocked in on site: tell the client once (in-app + push) and let admins see it.
+    app.post('/api/staff/jobs/:id/arrived', authenticateToken, async (req: any, res) => {
+        try {
+            const ctx = await loadAssignedStaffContext(db, req, res);
+            if (!ctx) return;
+            const { booking, me } = ctx;
+            if (String(booking.date) !== localYmd(new Date())) {
+                return res.status(400).json({ error: 'You can only clock in on the day of the job.' });
+            }
+            const coords = readCoords(req.body);
+            const now = new Date();
+            const firstArrival = !booking.arrivedAt;
+            const patch: Record<string, unknown> = {};
+            if (firstArrival) patch.arrivedAt = now;
+            // Arrival also counts as en route, so the "nobody on the way" warning never fires late.
+            if (!booking.enRouteAt) patch.enRouteAt = now;
+            if (coords) patch.cleanerLocation = { ...coords, at: now.toISOString(), staffId: Number(me.id), staffName: me.name };
+            if (Object.keys(patch).length) {
+                await db.update(bookings).set(patch).where(eq(bookings.id, Number(booking.id)));
+            }
+            if (firstArrival) {
+                const ref = String(booking.bookingId ?? booking.id);
+                if (booking.customerId) {
+                    await notifyUsers(db, [Number(booking.customerId)], {
+                        type: 'booking_update',
+                        message: `${me.name} has arrived and started your ${booking.serviceType} (booking ${ref}).`,
+                        pushTitle: 'Your cleaner has arrived',
+                        pushBody: `${me.name} has arrived and started your clean.`,
+                        data: { type: 'booking_update', bookingId: Number(booking.id) },
+                    });
+                }
+                await notifyAdmins(db, `${me.name} arrived at booking ${ref} (${booking.time}, ${booking.contactName}).`);
+                broadcastSync('notifications');
+            }
+            broadcastSync('bookings');
+            res.json({ arrivedAt: firstArrival ? now.toISOString() : new Date(booking.arrivedAt as unknown as string).toISOString() });
+        } catch (e) {
+            console.error('[job tracking] arrived', e);
+            res.status(500).json({ error: 'Failed to record arrival' });
+        }
+    });
+
     app.post('/api/staff/jobs/:id/en-route', authenticateToken, async (req: any, res) => {
         try {
             const ctx = await loadAssignedStaffContext(db, req, res);

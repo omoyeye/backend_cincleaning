@@ -144,6 +144,8 @@ export const bookings = mysqlTable('bookings', {
     noEnRouteWarningSentAt: timestamp('no_en_route_warning_sent_at'),
     /** Admin warned that the booking had no assigned cleaner within 24h of start. */
     unassignedWarningSentAt: timestamp('unassigned_warning_sent_at'),
+    /** When the cleaner clocked in on site (client is told once). */
+    arrivedAt: timestamp('arrived_at'),
 
     createdAt: timestamp('created_at').defaultNow(),
 
@@ -212,6 +214,16 @@ export const notifications = mysqlTable('notifications', {
     message: text('message').notNull(),
     isRead: boolean('is_read').default(false),
     createdAt: timestamp('created_at').defaultNow(),
+});
+
+/** Expo push tokens from the mobile app; one row per device, re-pointed if another user signs in on it. */
+export const pushTokens = mysqlTable('push_tokens', {
+    id: int().primaryKey().autoincrement(),
+    userId: int('user_id').notNull().references(() => users.id),
+    token: varchar('token', { length: 255 }).notNull().unique(),
+    platform: varchar('platform', { length: 20 }).notNull(),
+    createdAt: timestamp('created_at').defaultNow(),
+    lastSeenAt: timestamp('last_seen_at').defaultNow(),
 });
 
 export const bookingStaff = mysqlTable('booking_staff', {

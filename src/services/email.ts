@@ -31,11 +31,15 @@ export const sendEmail = async ({ to, subject, htmlContent }: SendEmailParams) =
 
     try {
         const data = await api.sendTransacEmail(sendSmtpEmail);
-        console.log('Email sent successfully. Returned data: ' + JSON.stringify(data));
+        const messageId = (data as any)?.body?.messageId ?? (data as any)?.messageId ?? '';
+        console.log(`Email sent: "${subject}"${messageId ? ` (${messageId})` : ''}`);
         return data;
-    } catch (error) {
-        console.error('Error sending email:', error);
-        throw error;
+    } catch (error: any) {
+        // Never log the raw client error: it carries the request headers, including the Brevo api-key.
+        const status = error?.response?.status ?? error?.statusCode ?? '';
+        const detail = error?.response?.data?.message ?? error?.body?.message ?? error?.message ?? 'unknown error';
+        console.error(`Error sending email "${subject}": ${status} ${detail}`.trim());
+        throw new Error(`Email send failed${status ? ` (${status})` : ''}: ${detail}`);
     }
 };
 

@@ -67,6 +67,17 @@ import {
 } from './bookingReminders';
 import { registerJobTrackingRoutes, runJobTrackingMonitor, trackingResetPatch } from './jobTracking';
 import { registerPushToken, unregisterPushToken } from './push';
+import {
+    emailAdmins,
+    emailFromTemplate,
+    friendlyDate,
+    notifyUsers,
+    pushUsers,
+    siteUrl as absoluteSiteUrl,
+    smsFromTemplate,
+    staffContacts,
+    adminUserIds as listAdminUserIds,
+} from './notify';
 import { runColumnMigrations } from './migrations';
 import { registerStaffAssessmentRoutes } from './staffAssessments';
 import {
@@ -419,6 +430,250 @@ function sanitizeBookingFlowInput(raw: unknown): { trigger: ValidServiceTrigger;
     return { trigger, steps };
 }
 
+/** Admin moved or cancelled a booking: tell the client (email, in-app, push) and the cleaners on it. */
+async function notifyAdminBookingChange(
+    kind: 'rescheduled' | 'cancelled',
+    before: typeof bookings.$inferSelect,
+    after: { date: string; time: string },
+    skipStaffIds: number[],
+): Promise<void> {
+    const ref = String(before.bookingId ?? before.id);
+    const links = await db.select().from(bookingStaff).where(eq(bookingStaff.bookingId, before.id));
+    const teamIds = new Set<number>(links.map((l) => Number(l.staffId)).filter((n) => n > 0));
+    if (before.assignedStaffId) teamIds.add(Number(before.assignedStaffId));
+    const team = (await staffContacts(db, [...teamIds])).filter((c) => !skipStaffIds.includes(c.staffId));
+    const jobAddress = [before.addressLine1, before.addressCity, before.addressPostcode].filter(Boolean).join(', ');
+    const clientName = before.contactName || 'there';
+    const data = { type: 'booking_update', bookingId: Number(before.id) };
+
+    if (kind === 'rescheduled') {
+        const oldWhen = `${friendlyDate(before.date)} ${before.time}`;
+        const newWhen = `${friendlyDate(after.date)} at ${after.time}`;
+        await emailFromTemplate(db, 'client_booking_rescheduled', { email: before.contactEmail, name: before.contactName }, {
+            client_name: clientName,
+            booking_id: ref,
+            service_type: String(before.serviceType || 'Cleaning'),
+            old_date: friendlyDate(before.date),
+            old_time: String(before.time || ''),
+            service_date: friendlyDate(after.date),
+            service_time: after.time,
+            job_address: jobAddress,
+            portal_url: absoluteSiteUrl('/my-account'),
+        });
+        await notifyUsers(db, [before.customerId], {
+            type: 'booking_update',
+            message: `Your booking ${ref} has moved from ${oldWhen} to ${newWhen}.`,
+            pushTitle: 'Your booking time has changed',
+            pushBody: `${ref} is now ${newWhen}.`,
+            data,
+        });
+        for (const c of team) {
+            await smsFromTemplate(db, 'staff_booking_rescheduled_sms', c.phone, {
+                staff_name: c.name,
+                booking_id: ref,
+                old_date: friendlyDate(before.date),
+                old_time: String(before.time || ''),
+                service_date: friendlyDate(after.date),
+                service_time: after.time,
+                job_address: jobAddress,
+            });
+        }
+        await notifyUsers(db, team.map((c) => c.userId), {
+            message: `Job ${ref} (${before.contactName || 'Client'}) has moved from ${oldWhen} to ${newWhen}.`,
+            pushTitle: 'Job time changed',
+            pushBody: `${ref} is now ${newWhen}.`,
+            data: { type: 'job_update', bookingId: Number(before.id) },
+        });
+    } else {
+        const when = `${friendlyDate(before.date)} at ${before.time}`;
+        await emailFromTemplate(db, 'client_booking_cancelled_by_us', { email: before.contactEmail, name: before.contactName }, {
+            client_name: clientName,
+            booking_id: ref,
+            service_type: String(before.serviceType || 'Cleaning'),
+            service_date: friendlyDate(before.date),
+            service_time: String(before.time || ''),
+        });
+        await notifyUsers(db, [before.customerId], {
+            type: 'booking_update',
+            message: `Your booking ${ref} on ${when} has been cancelled. Check your email for details.`,
+            pushTitle: 'Booking cancelled',
+            pushBody: `${ref} on ${when} has been cancelled.`,
+            data,
+        });
+        await notifyUsers(db, team.map((c) => c.userId), {
+            type: 'booking_cancelled',
+            message: `Job ${ref} (${before.contactName || 'Client'}) on ${when} has been cancelled. No need to attend.`,
+            pushTitle: 'Job cancelled',
+            pushBody: `${ref} on ${when} is cancelled. No need to attend.`,
+            data: { type: 'job_update', bookingId: Number(before.id) },
+        });
+    }
+}
+
+/** Clients may move their own booking up to this many hours before it starts (and to at least this far ahead). */
+const CLIENT_RESCHEDULE_NOTICE_HOURS = 24;
+
+/**
+ * Client moves their own booking. Cleaners who are still free keep the job; anyone who would
+ * clash at the new time is taken off it and the job returns to "Needs a cleaner" for admin.
+ */
+async function handleCustomerReschedule(req: any, res: any, booking: typeof bookings.$inferSelect, updates: Record<string, unknown>) {
+    const ref = String(booking.bookingId ?? booking.id);
+    const status = String(booking.status || '');
+    if (status !== 'Pending' && status !== 'Confirmed') {
+        return res.status(400).json({ error: `This booking is ${status.toLowerCase()} and can't be moved.` });
+    }
+    const newDate = String(updates.date ?? booking.date).trim();
+    const newTime = String(updates.time ?? booking.time).trim().slice(0, 5);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(newDate) || !/^([01]\d|2[0-3]):[0-5]\d$/.test(newTime)) {
+        return res.status(400).json({ error: 'Please choose a valid date and time.' });
+    }
+    if (newDate === String(booking.date) && newTime === String(booking.time).slice(0, 5)) {
+        return res.status(400).json({ error: 'Pick a different date or time.' });
+    }
+    const now = Date.now();
+    const noticeMs = CLIENT_RESCHEDULE_NOTICE_HOURS * 3600000;
+    const currentStart = parseLocalBookingStartMs(booking.date, booking.time);
+    const newStart = parseLocalBookingStartMs(newDate, newTime);
+    if (!Number.isFinite(newStart)) return res.status(400).json({ error: 'Please choose a valid date and time.' });
+    if (Number.isFinite(currentStart) && currentStart - now < noticeMs) {
+        return res.status(400).json({
+            error: `Bookings can be moved up to ${CLIENT_RESCHEDULE_NOTICE_HOURS} hours before they start. Please contact us to change this one.`,
+            code: 'reschedule_window_closed',
+        });
+    }
+    if (newStart - now < noticeMs) {
+        return res.status(400).json({ error: `Please choose a new time at least ${CLIENT_RESCHEDULE_NOTICE_HOURS} hours from now.` });
+    }
+    if (newStart - now > 365 * 86400000) {
+        return res.status(400).json({ error: 'Please choose a date within the next 12 months.' });
+    }
+
+    // Which assigned cleaners would clash at the new time?
+    const links = await db.select().from(bookingStaff).where(eq(bookingStaff.bookingId, booking.id));
+    const teamIds = [...new Set([...links.map((l) => Number(l.staffId)), ...(booking.assignedStaffId ? [Number(booking.assignedStaffId)] : [])])].filter((n) => n > 0);
+    let clashingIds: number[] = [];
+    if (teamIds.length) {
+        const [allRows, allLinks, svcRows, exRows] = await Promise.all([
+            db.select({
+                id: bookings.id, bookingId: bookings.bookingId, customerId: bookings.customerId, serviceType: bookings.serviceType,
+                date: bookings.date, time: bookings.time, status: bookings.status, totalPrice: bookings.totalPrice,
+                addressLine1: bookings.addressLine1, addressCity: bookings.addressCity, addressPostcode: bookings.addressPostcode,
+                contactName: bookings.contactName, contactEmail: bookings.contactEmail, contactPhone: bookings.contactPhone,
+                propertyDetails: bookings.propertyDetails, extras: bookings.extras, assignedStaffId: bookings.assignedStaffId,
+            }).from(bookings),
+            db.select().from(bookingStaff),
+            db.select().from(services),
+            db.select().from(extraServices),
+        ]);
+        const assignmentMap = new Map<number, number[]>();
+        for (const a of allLinks) {
+            const bid = Number(a.bookingId);
+            if (!assignmentMap.has(bid)) assignmentMap.set(bid, []);
+            assignmentMap.get(bid)!.push(Number(a.staffId));
+        }
+        clashingIds = teamIds.filter((sid) =>
+            computeAdminPatchScheduleConflicts(allRows, assignmentMap, booking.id, { date: newDate, time: newTime }, [sid], svcRows, exRows).length > 0,
+        );
+    }
+    const keptIds = teamIds.filter((sid) => !clashingIds.includes(sid));
+
+    // Save the move and reset the day-of tracking so reminders and prompts run again for the new time.
+    const patch: Record<string, unknown> = {
+        date: newDate,
+        time: newTime,
+        reminder48SentAt: null,
+        reminder24SentAt: null,
+        onTheWayPromptSentAt: null,
+        noEnRouteWarningSentAt: null,
+        unassignedWarningSentAt: null,
+        enRouteAt: null,
+        arrivedAt: null,
+        cleanerLocation: null,
+    };
+    if (clashingIds.length) {
+        patch.assignedStaffId = keptIds[0] ?? null;
+        if (!keptIds.length) patch.status = 'Pending';
+    }
+    await db.update(bookings).set(patch as any).where(eq(bookings.id, booking.id));
+    if (clashingIds.length) {
+        await db.delete(bookingStaff).where(and(eq(bookingStaff.bookingId, booking.id), inArray(bookingStaff.staffId, clashingIds)));
+    }
+
+    const oldDateLabel = friendlyDate(booking.date);
+    const oldTime = String(booking.time || '').slice(0, 5);
+    const newWhen = `${friendlyDate(newDate)} at ${newTime}`;
+    const jobAddress = [booking.addressLine1, booking.addressCity, booking.addressPostcode].filter(Boolean).join(', ');
+    const kept = await staffContacts(db, keptIds);
+    const removed = await staffContacts(db, clashingIds);
+
+    await emailFromTemplate(db, 'client_reschedule_confirmed', { email: booking.contactEmail, name: booking.contactName }, {
+        client_name: booking.contactName || 'there',
+        booking_id: ref,
+        service_type: String(booking.serviceType || 'Cleaning'),
+        old_date: oldDateLabel,
+        old_time: oldTime,
+        service_date: friendlyDate(newDate),
+        service_time: newTime,
+        job_address: jobAddress,
+        portal_url: absoluteSiteUrl('/my-account'),
+    });
+    await notifyUsers(db, [booking.customerId], {
+        type: 'booking_update',
+        message: `You moved booking ${ref} to ${newWhen}.`,
+        pushTitle: 'Booking moved',
+        data: { type: 'booking_update', bookingId: Number(booking.id) },
+    });
+    for (const c of kept) {
+        await smsFromTemplate(db, 'staff_booking_rescheduled_sms', c.phone, {
+            staff_name: c.name, booking_id: ref, old_date: oldDateLabel, old_time: oldTime,
+            service_date: friendlyDate(newDate), service_time: newTime, job_address: jobAddress,
+        });
+    }
+    await notifyUsers(db, kept.map((c) => c.userId), {
+        message: `The client moved job ${ref} from ${oldDateLabel} ${oldTime} to ${newWhen}.`,
+        pushTitle: 'Job time changed',
+        pushBody: `${ref} is now ${newWhen}.`,
+        data: { type: 'job_update', bookingId: Number(booking.id) },
+    });
+    await notifyUsers(db, removed.map((c) => c.userId), {
+        message: `The client moved job ${ref} to ${newWhen}, which clashes with another of your jobs, so you've been taken off it. No need to attend.`,
+        pushTitle: 'Taken off a job',
+        pushBody: `${ref} moved to ${newWhen} and clashes with your schedule. No need to attend.`,
+        data: { type: 'job_update', bookingId: Number(booking.id) },
+    });
+    const teamLine = !teamIds.length
+        ? 'No cleaner was assigned yet.'
+        : removed.length
+            ? `${removed.map((c) => c.name).join(', ')} had a clash at the new time and ${removed.length === 1 ? 'was' : 'were'} taken off.${keptIds.length ? ` Still on the job: ${kept.map((c) => c.name).join(', ')}.` : ' The job now needs a cleaner.'}`
+            : `${kept.map((c) => c.name).join(', ')} ${kept.length === 1 ? 'is' : 'are'} still free and keep the job.`;
+    await notifyUsers(db, await listAdminUserIds(db), {
+        message: `${booking.contactName || 'A client'} moved ${ref} from ${oldDateLabel} ${oldTime} to ${newWhen}. ${teamLine}`,
+        pushTitle: removed.length && !keptIds.length ? 'Moved booking needs a cleaner' : 'Client moved a booking',
+    });
+    await emailAdmins(db, 'admin_booking_rescheduled_alert', {
+        client_name: booking.contactName || 'Client',
+        booking_id: ref,
+        service_type: String(booking.serviceType || 'Cleaning'),
+        old_date: oldDateLabel,
+        old_time: oldTime,
+        service_date: friendlyDate(newDate),
+        service_time: newTime,
+        team_line: teamLine,
+        admin_url: absoluteSiteUrl('/admin'),
+    });
+
+    broadcastSync('all');
+    broadcastSync('notifications');
+    return res.json({
+        message: 'Booking moved',
+        date: newDate,
+        time: newTime,
+        status: patch.status ?? status,
+        cleanerKept: keptIds.length > 0,
+    });
+}
+
 async function notifyAssignedStaffSms(
     staffIds: number[],
     booking: {
@@ -639,23 +894,74 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
         const pi = event.data.object as Stripe.PaymentIntent;
         const invoiceId = pi.metadata?.invoiceId;
         const bookingId = pi.metadata?.bookingId;
+        const amountPaid = (Number(pi.amount_received || pi.amount) || 0) / 100;
+        const paidAtLabel = new Date().toLocaleString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
         if (invoiceId) {
             try {
+                const before = await db.select().from(customerInvoices).where(eq(customerInvoices.id, Number(invoiceId))).limit(1);
                 await db.update(customerInvoices).set({
                     status: 'paid',
                     paidAt: new Date(),
                 }).where(eq(customerInvoices.id, Number(invoiceId)));
                 console.log(`[stripe] Invoice #${invoiceId} marked paid via webhook`);
                 broadcastSync('all');
+                const inv = before[0];
+                if (inv && inv.status !== 'paid') {
+                    await emailFromTemplate(db, 'client_payment_receipt', { email: inv.customerEmail, name: inv.customerName }, {
+                        client_name: inv.customerName || 'there',
+                        amount: amountPaid.toFixed(2),
+                        reference_label: inv.invoiceNumber,
+                        payment_for: `Invoice ${inv.invoiceNumber}`,
+                        paid_at: paidAtLabel,
+                    });
+                    await notifyUsers(db, await listAdminUserIds(db), {
+                        message: `Payment received: £${amountPaid.toFixed(2)} for invoice ${inv.invoiceNumber} (${inv.customerName}).`,
+                        pushTitle: 'Payment received',
+                    });
+                    if (inv.customerId) {
+                        await notifyUsers(db, [inv.customerId], {
+                            type: 'booking_update',
+                            message: `Thank you, we received £${amountPaid.toFixed(2)} for invoice ${inv.invoiceNumber}.`,
+                            pushTitle: 'Payment received',
+                            data: { type: 'invoice' },
+                        });
+                    }
+                    broadcastSync('notifications');
+                }
             } catch (e: any) {
                 console.error('[stripe] Failed to update invoice:', e?.message);
             }
         }
         if (bookingId) {
             try {
+                const before = await db.select().from(bookings).where(eq(bookings.id, Number(bookingId))).limit(1);
                 await db.update(bookings).set({ invoicePaid: true }).where(eq(bookings.id, Number(bookingId)));
                 console.log(`[stripe] Booking #${bookingId} deposit marked paid via webhook`);
                 broadcastSync('all');
+                const b = before[0];
+                if (b && !b.invoicePaid) {
+                    const ref = String(b.bookingId ?? b.id);
+                    await emailFromTemplate(db, 'client_payment_receipt', { email: b.contactEmail, name: b.contactName }, {
+                        client_name: b.contactName || 'there',
+                        amount: amountPaid.toFixed(2),
+                        reference_label: ref,
+                        payment_for: `${b.serviceType || 'Cleaning'} on ${friendlyDate(b.date)} at ${b.time}`,
+                        paid_at: paidAtLabel,
+                    });
+                    await notifyUsers(db, await listAdminUserIds(db), {
+                        message: `Payment received: £${amountPaid.toFixed(2)} for booking ${ref} (${b.contactName}).`,
+                        pushTitle: 'Payment received',
+                    });
+                    if (b.customerId) {
+                        await notifyUsers(db, [b.customerId], {
+                            type: 'booking_update',
+                            message: `Thank you, we received £${amountPaid.toFixed(2)} for booking ${ref}.`,
+                            pushTitle: 'Payment received',
+                            data: { type: 'booking_update', bookingId: Number(b.id) },
+                        });
+                    }
+                    broadcastSync('notifications');
+                }
             } catch (e: any) {
                 console.error('[stripe] Failed to update booking:', e?.message);
             }
@@ -2218,6 +2524,16 @@ app.post('/api/quote-submit', async (req, res) => {
             console.error('[quote-submit] admin notification failed:', notifyErr);
         }
         broadcastSync('quotes');
+        await emailAdmins(db, 'admin_new_quote_alert', {
+            client_name: firstName,
+            client_email: email,
+            client_phone: phone || 'no phone given',
+            service_type: serviceType,
+            property_summary: [bedrooms && `${bedrooms} bed`, bathrooms && `${bathrooms} bath`].filter(Boolean).join(', ') || 'not given',
+            postcode: postcode || 'not given',
+            price_line: priceEstimate == null ? 'Bespoke quote' : `£${priceEstimate.toFixed(2)}`,
+            admin_url: absoluteSiteUrl('/admin'),
+        });
 
         // 3. Email the visitor their estimate (the main purpose of collecting the address).
         try {
@@ -3353,9 +3669,14 @@ app.patch('/api/bookings/:id', authenticateToken, async (req: any, res) => {
                 return res.json({ message: 'Booking updated' });
             }
 
+            // Moving the booking (date and/or time only) has its own rules.
+            if (keys.length > 0 && keys.every((k) => k === 'date' || k === 'time')) {
+                return handleCustomerReschedule(req, res, booking, bookingUpdates as Record<string, unknown>);
+            }
+
             const statusOnly = keys.length === 1 && keys[0] === 'status';
             if (!statusOnly) {
-                return res.status(403).json({ error: 'Customers can only cancel bookings or submit ratings.' });
+                return res.status(403).json({ error: 'Customers can only move, cancel or rate bookings.' });
             }
 
             if (bookingUpdates.status !== 'Cancelled') {
@@ -3492,6 +3813,18 @@ app.patch('/api/bookings/:id', authenticateToken, async (req: any, res) => {
         }
         await db.update(bookings).set(finalPatch as any).where(eq(bookings.id, id));
 
+        const nextDate = String(bookingUpdates.date ?? booking.date);
+        const nextTime = String(bookingUpdates.time ?? booking.time);
+        const nextStatus = String(bookingUpdates.status ?? booking.status);
+        const isAdminCancel =
+            req.user.role === 'admin' && nextStatus === 'Cancelled' && String(booking.status) !== 'Cancelled';
+        const isAdminReschedule =
+            req.user.role === 'admin' &&
+            !isAdminCancel &&
+            nextStatus !== 'Completed' &&
+            (nextDate !== String(booking.date) || nextTime !== String(booking.time));
+        let addedStaffIdsThisUpdate: number[] = [];
+
         if (assignedStaffIds && Array.isArray(assignedStaffIds) && req.user.role === 'admin') {
             // Snapshot who was previously linked so we can notify them if this patch removes them.
             const prevLinks = await db
@@ -3511,37 +3844,84 @@ app.patch('/api/bookings/:id', authenticateToken, async (req: any, res) => {
                     }))
                 );
 
-                // Notify newly assigned staff
-                const assignedNames: string[] = [];
-                for (let sid of assignedStaffIds) {
-                    const staffRecord = await db.select().from(staff).where(eq(staff.id, sid));
-                    if (staffRecord.length > 0 && staffRecord[0].userId) {
-                        assignedNames.push(staffRecord[0].name);
+                // Only people newly added to the job hear about it; re-saving the same team stays quiet.
+                const addedStaffIds = Array.from(nextStaffIds).filter((sid) => !prevStaffIds.has(sid));
+                const jobDate = String(bookingUpdates.date ?? booking.date);
+                const jobTime = String(bookingUpdates.time ?? booking.time);
+                const teamNames: string[] = [];
+                for (const sid of nextStaffIds) {
+                    const staffRecord = await db.select().from(staff).where(eq(staff.id, sid)).limit(1);
+                    if (!staffRecord.length) continue;
+                    teamNames.push(staffRecord[0].name);
+                    if (addedStaffIds.includes(sid) && staffRecord[0].userId) {
                         await db.insert(notifications).values({
                             userId: staffRecord[0].userId,
                             type: 'system',
-                            message: `New assignment: Booking ${displayBookingLabel} for ${booking.contactName || 'Client'} on ${booking.date} at ${booking.time} (${(booking.propertyDetails as any)?.duration || 'N/A'}h).`,
+                            message: `New assignment: Booking ${displayBookingLabel} for ${booking.contactName || 'Client'} on ${jobDate} at ${jobTime} (${(booking.propertyDetails as any)?.duration || 'N/A'}h).`,
                             isRead: false
                         });
                     }
                 }
-                if (booking.customerId) {
+                for (const sid of removedStaffIds) {
+                    const staffRecord = await db.select().from(staff).where(eq(staff.id, sid)).limit(1);
+                    if (staffRecord.length > 0 && staffRecord[0].userId) {
+                        await db.insert(notifications).values({
+                            userId: staffRecord[0].userId,
+                            type: 'system',
+                            message: `You have been taken off booking ${displayBookingLabel} (${booking.contactName || 'Client'} · ${jobDate} ${jobTime}). No need to attend.`,
+                            isRead: false,
+                        });
+                    }
+                }
+                if (booking.customerId && addedStaffIds.length > 0) {
                     await db.insert(notifications).values({
                         userId: booking.customerId,
                         type: 'booking_update',
-                        message: `Your booking ${displayBookingLabel} has been assigned to ${assignedNames.join(', ') || 'our team'} on ${booking.date} at ${booking.time}.`,
+                        message: `Your booking ${displayBookingLabel} has been assigned to ${teamNames.join(', ') || 'our team'} on ${jobDate} at ${jobTime}.`,
                         isRead: false
                     });
                 }
-                await notifyAssignedStaffSms(assignedStaffIds, {
+                await notifyAssignedStaffSms(addedStaffIds, {
                     displayBookingId: displayBookingLabel,
                     contactName: booking.contactName,
-                    date: booking.date,
-                    time: booking.time,
+                    date: jobDate,
+                    time: jobTime,
                     addressLine1: booking.addressLine1,
                     addressCity: booking.addressCity,
                     addressPostcode: booking.addressPostcode,
                 });
+                addedStaffIdsThisUpdate = addedStaffIds;
+                const whenLabel = `${friendlyDate(jobDate)} at ${jobTime}`;
+                const added = await staffContacts(db, addedStaffIds);
+                pushUsers(added.map((c) => c.userId), 'New job assigned', `${displayBookingLabel}: ${booking.contactName || 'Client'}, ${whenLabel}.`, {
+                    type: 'job_assigned',
+                    bookingId: Number(id),
+                });
+                const removed = await staffContacts(db, removedStaffIds);
+                pushUsers(removed.map((c) => c.userId), 'Taken off a job', `No need to attend ${displayBookingLabel} on ${whenLabel}.`, {
+                    type: 'job_update',
+                    bookingId: Number(id),
+                });
+                const startsInFuture = parseLocalBookingStartMs(jobDate, jobTime) > Date.now();
+                if (addedStaffIds.length > 0 && startsInFuture && !isAdminCancel && nextStatus !== 'Completed') {
+                    const cleanerNames = teamNames.length > 1
+                        ? `${teamNames.slice(0, -1).join(', ')} and ${teamNames[teamNames.length - 1]}`
+                        : teamNames[0] || 'our team';
+                    pushUsers([booking.customerId], 'Your cleaner is confirmed', `${cleanerNames} will clean for you on ${whenLabel}.`, {
+                        type: 'booking_update',
+                        bookingId: Number(id),
+                    });
+                    await emailFromTemplate(db, 'client_cleaner_assigned', { email: booking.contactEmail, name: booking.contactName }, {
+                        client_name: booking.contactName || 'there',
+                        booking_id: displayBookingLabel,
+                        service_type: String(booking.serviceType || 'Cleaning'),
+                        service_date: friendlyDate(jobDate),
+                        service_time: jobTime,
+                        cleaner_names: cleanerNames,
+                        job_address: [booking.addressLine1, booking.addressCity, booking.addressPostcode].filter(Boolean).join(', '),
+                        portal_url: absoluteSiteUrl('/my-account'),
+                    });
+                }
             } else if (prevStaffIds.size > 0) {
                 // Admin fully unassigned the booking — notify removed staff and the client so everyone sees the reset.
                 for (const sid of removedStaffIds) {
@@ -3555,6 +3935,11 @@ app.patch('/api/bookings/:id', authenticateToken, async (req: any, res) => {
                         });
                     }
                 }
+                const removedAll = await staffContacts(db, removedStaffIds);
+                pushUsers(removedAll.map((c) => c.userId), 'Taken off a job', `No need to attend ${displayBookingLabel} on ${friendlyDate(booking.date)} at ${booking.time}.`, {
+                    type: 'job_update',
+                    bookingId: Number(id),
+                });
                 if (booking.customerId) {
                     await db.insert(notifications).values({
                         userId: booking.customerId,
@@ -3564,7 +3949,12 @@ app.patch('/api/bookings/:id', authenticateToken, async (req: any, res) => {
                     });
                 }
             }
-        } else if (req.user.role === 'admin' && (bookingUpdates.date || bookingUpdates.time || bookingUpdates.status)) {
+        } else if (
+            req.user.role === 'admin' &&
+            !isAdminReschedule &&
+            !isAdminCancel &&
+            (bookingUpdates.date || bookingUpdates.time || bookingUpdates.status)
+        ) {
             // Check if existing staff exist and notify them of the change automatically
             const assignments = await db.select().from(bookingStaff).where(eq(bookingStaff.bookingId, id));
             for (let a of assignments) {
@@ -3684,6 +4074,19 @@ app.patch('/api/bookings/:id', authenticateToken, async (req: any, res) => {
                 console.error('Cancellation emails (Brevo):', emailErr);
             }
         }
+        if (isAdminReschedule || isAdminCancel) {
+            try {
+                await notifyAdminBookingChange(
+                    isAdminCancel ? 'cancelled' : 'rescheduled',
+                    booking,
+                    { date: nextDate, time: nextTime },
+                    addedStaffIdsThisUpdate,
+                );
+            } catch (notifyErr) {
+                console.error('[booking update] change notifications failed:', notifyErr);
+            }
+        }
+
         broadcastSync('all');
         broadcastSync('notifications');
         res.json({ message: 'Booking updated' });
@@ -3787,6 +4190,15 @@ app.post('/api/bookings/:id/staff-cancel-request', authenticateToken, async (req
             message: `Your cancellation request for booking ${displayBookingLabel} was sent to admin for review.`,
             isRead: false,
         });
+        await emailAdmins(db, 'admin_staff_cancel_request_alert', {
+            staff_name: staffProfile.name,
+            booking_id: displayBookingLabel,
+            client_name: booking.contactName || 'Client',
+            service_date: friendlyDate(booking.date),
+            service_time: String(booking.time || ''),
+            reason: reason || 'No reason given',
+            admin_url: absoluteSiteUrl('/admin'),
+        });
 
         broadcastSync('notifications');
         res.json({ success: true, message: 'Cancellation request sent to admin.' });
@@ -3888,11 +4300,18 @@ app.post('/api/admin/staff-cancel-requests/:id/respond', authenticateToken, asyn
                 .limit(1);
             if (lr.length) bookingLabelForNotify = String(lr[0].bookingId ?? bidNumEarly);
         }
+        // Superadmin sessions carry a superadmins id, so link the responder by email to a users row (or leave it empty).
+        const responderRows = await db
+            .select({ id: users.id })
+            .from(users)
+            .where(eq(users.email, String(req.user.email || '').trim().toLowerCase()))
+            .limit(1);
+        const respondedBy = responderRows[0]?.id ?? null;
         await poolConnection.query(
             `UPDATE staff_cancel_requests
              SET status = ?, admin_notes = ?, responded_by = ?, responded_at = CURRENT_TIMESTAMP
              WHERE id = ?`,
-            [decisionRaw === 'approve' ? 'Approved' : 'Rejected', adminNote || null, Number(req.user.id) || 0, requestId]
+            [decisionRaw === 'approve' ? 'Approved' : 'Rejected', adminNote || null, respondedBy, requestId]
         );
 
         const staffUserId = Number(reqRow.staff_user_id);
@@ -3906,10 +4325,19 @@ app.post('/api/admin/staff-cancel-requests/:id/respond', authenticateToken, asyn
                         : `Admin declined your cancellation request for booking ${bookingLabelForNotify}.${adminNote ? ` Note: ${adminNote}` : ''}`,
                 isRead: false,
             });
+            pushUsers(
+                [staffUserId],
+                decisionRaw === 'approve' ? 'Cancellation approved' : 'Cancellation declined',
+                decisionRaw === 'approve'
+                    ? `You no longer need to attend ${bookingLabelForNotify}.`
+                    : `Please still attend ${bookingLabelForNotify}.${adminNote ? ` Note: ${adminNote}` : ''}`,
+                { type: 'job_update' },
+            );
         }
         broadcastSync('all');
         res.json({ success: true });
     } catch (error) {
+        console.error('[staff cancel request] respond failed:', error);
         res.status(500).json({ error: 'Failed to respond to cancellation request' });
     }
 });
@@ -4830,6 +5258,7 @@ app.patch('/api/invoices/:id', authenticateToken, async (req: any, res) => {
                 message: `Your weekly invoice (${existing[0].weekLabel || 'current week'}) was ${String(status).toLowerCase()} by admin.${note}`,
                 isRead: false,
             });
+            pushUsers([staffUserId], `Invoice ${String(status).toLowerCase()}`, `Your invoice for ${existing[0].weekLabel || 'this week'} was ${String(status).toLowerCase()}.${note}`, { type: 'invoice' });
         } else if (staffUserId > 0 && !statusChanged && patch.adminNotes && patch.adminNotes !== existing[0].adminNotes) {
             await db.insert(notifications).values({
                 userId: staffUserId,
@@ -4837,6 +5266,7 @@ app.patch('/api/invoices/:id', authenticateToken, async (req: any, res) => {
                 message: `Admin added a note to your weekly invoice (${existing[0].weekLabel || 'current week'}): ${patch.adminNotes}`,
                 isRead: false,
             });
+            pushUsers([staffUserId], 'Note on your invoice', String(patch.adminNotes), { type: 'invoice' });
         }
 
         broadcastSync('all');
@@ -4868,6 +5298,7 @@ app.delete('/api/invoices/:id', authenticateToken, async (req: any, res) => {
                 message: `Your weekly invoice (${existing[0].weekLabel || 'current week'}) was removed by admin. Please check your jobs and submit it again if needed.`,
                 isRead: false,
             });
+            pushUsers([staffUserId], 'Invoice removed', `Your invoice for ${existing[0].weekLabel || 'this week'} was removed. You can submit it again.`, { type: 'invoice' });
         }
 
         broadcastSync('all');
@@ -5887,7 +6318,6 @@ async function notifyBookingChatRecipients(
     }
 
     if (senderRole === 'customer' || senderRole === 'staff') {
-        targets.add(1);
         const adminUsers = await db.select({ id: users.id }).from(users).where(eq(users.role, 'admin'));
         for (const u of adminUsers) targets.add(Number(u.id));
     }
@@ -5904,6 +6334,7 @@ async function notifyBookingChatRecipients(
             isRead: false,
         })),
     );
+    pushUsers([...targets], `${senderName} · ${displayBookingId}`, preview, { type: 'chat_message', bookingId: numericBookingId });
 }
 
 app.post('/api/bookings/:id/chat', authenticateToken, async (req: any, res) => {
@@ -7016,16 +7447,24 @@ app.post('/api/push/register', authenticateToken, (req: any, res) => {
     const userId = Number(req.user?.id);
     const { token, platform } = req.body || {};
     if (!token || !platform) return res.status(400).json({ error: 'token and platform required' });
-    registerPushToken(userId, String(token), String(platform));
-    res.json({ ok: true });
+    registerPushToken(userId, String(token), String(platform))
+        .then(() => res.json({ ok: true }))
+        .catch((e) => {
+            console.error('[push] register failed:', e);
+            res.status(500).json({ error: 'Could not register device' });
+        });
 });
 
 app.post('/api/push/unregister', authenticateToken, (req: any, res) => {
     const userId = Number(req.user?.id);
     const { token } = req.body || {};
     if (!token) return res.status(400).json({ error: 'token required' });
-    unregisterPushToken(userId, String(token));
-    res.json({ ok: true });
+    unregisterPushToken(userId, String(token))
+        .then(() => res.json({ ok: true }))
+        .catch((e) => {
+            console.error('[push] unregister failed:', e);
+            res.status(500).json({ error: 'Could not unregister device' });
+        });
 });
 
 // ── Expense tracker routes ──

@@ -331,6 +331,124 @@ export const DEFAULT_EMAIL_TEMPLATES: EmailTemplateSeed[] = [
 <p style="font-size:13px;color:#475569;">Team jobs: pay = (booked hours ÷ staff on job) × hourly rate. Client job totals are for reference only.</p>
 {{job_table_html}}`,
   },
+  {
+    name: 'client_booking_rescheduled',
+    subject: 'Your booking {{booking_id}} has moved to {{service_date}} at {{service_time}}',
+    description: 'Sent to the client when admin changes the date or time of their booking.',
+    variables: ['client_name', 'booking_id', 'service_type', 'old_date', 'old_time', 'service_date', 'service_time', 'job_address', 'portal_url', 'brand_name', 'brand_primary', 'footer_note'],
+    body: `<p>Hi {{client_name}},</p>
+<p>We've moved your booking <strong>{{booking_id}}</strong> to a new time.</p>
+<p style="margin-top:16px;padding:14px 16px;background:#f8fafc;border-radius:10px;border:1px solid #e2e8f0;">
+  <strong>{{service_type}}</strong><br />
+  <span style="color:#94a3b8;text-decoration:line-through;">{{old_date}} at {{old_time}}</span><br />
+  <span style="color:#0f172a;">Now: <strong>{{service_date}} at {{service_time}}</strong></span><br />
+  <span style="color:#64748b;">{{job_address}}</span>
+</p>
+<p>If the new time doesn't suit you, reply to this email or contact us and we'll sort it out.</p>
+<p><a href="{{portal_url}}" style="color:{{brand_primary}};font-weight:700;">View your booking</a></p>`,
+  },
+  {
+    name: 'client_booking_cancelled_by_us',
+    subject: 'Booking {{booking_id}} has been cancelled',
+    description: 'Sent to the client when admin cancels their booking.',
+    variables: ['client_name', 'booking_id', 'service_type', 'service_date', 'service_time', 'brand_name', 'brand_primary', 'footer_note'],
+    body: `<p>Hi {{client_name}},</p>
+<p>We're sorry to let you know that booking <strong>{{booking_id}}</strong> has been <strong>cancelled</strong>.</p>
+<p style="margin-top:16px;padding:14px 16px;background:#f8fafc;border-radius:10px;border:1px solid #e2e8f0;">
+  <strong>{{service_type}}</strong><br />
+  <span style="color:#0f172a;">{{service_date}}</span> at <strong>{{service_time}}</strong>
+</p>
+<p>If you have already paid, any refund due will be processed to your original payment method. To rebook or ask a question, reply to this email or contact us using the details below.</p>`,
+  },
+  {
+    name: 'client_cleaner_assigned',
+    subject: 'Meet your cleaner for {{service_date}}: {{cleaner_names}}',
+    description: 'Sent to the client when a cleaner is assigned to their booking.',
+    variables: ['client_name', 'booking_id', 'service_type', 'service_date', 'service_time', 'cleaner_names', 'job_address', 'portal_url', 'brand_name', 'brand_primary', 'footer_note'],
+    body: `<p>Hi {{client_name}},</p>
+<p>Good news: <strong>{{cleaner_names}}</strong> will be looking after your booking <strong>{{booking_id}}</strong>.</p>
+<p style="margin-top:16px;padding:14px 16px;background:#f8fafc;border-radius:10px;border:1px solid #e2e8f0;">
+  <strong>{{service_type}}</strong><br />
+  <span style="color:#0f172a;">{{service_date}}</span> at <strong>{{service_time}}</strong><br />
+  <span style="color:#64748b;">{{job_address}}</span>
+</p>
+<p>On the day you'll get a message when your cleaner is on the way, and you can follow them live in your account.</p>
+<p><a href="{{portal_url}}" style="color:{{brand_primary}};font-weight:700;">View your booking</a></p>`,
+  },
+  {
+    name: 'client_payment_receipt',
+    subject: 'Payment received: £{{amount}} ({{reference_label}})',
+    description: 'Receipt sent to the client when a card payment succeeds (invoice or booking deposit).',
+    variables: ['client_name', 'amount', 'reference_label', 'payment_for', 'paid_at', 'brand_name', 'brand_primary', 'footer_note'],
+    body: `<p>Hi {{client_name}},</p>
+<p>Thank you, we've received your payment.</p>
+<p style="margin-top:16px;padding:14px 16px;background:#f8fafc;border-radius:10px;border:1px solid #e2e8f0;">
+  <span style="color:#64748b;">Amount</span><br />
+  <strong style="font-size:20px;color:#0f172a;">£{{amount}}</strong><br />
+  <span style="color:#64748b;">For:</span> {{payment_for}}<br />
+  <span style="color:#64748b;">Reference:</span> {{reference_label}}<br />
+  <span style="color:#64748b;">Paid:</span> {{paid_at}}
+</p>
+<p style="font-size:14px;color:#64748b;">Keep this email as your receipt.</p>`,
+  },
+  {
+    name: 'admin_new_quote_alert',
+    subject: 'New quote request: {{client_name}} ({{service_type}})',
+    description: 'Sent to the business inbox when someone finishes the homepage free quote.',
+    variables: ['client_name', 'client_email', 'client_phone', 'service_type', 'property_summary', 'postcode', 'price_line', 'admin_url', 'brand_name', 'brand_primary', 'footer_note'],
+    body: `<h2 style="margin:0 0 12px;color:#0f172a;font-size:18px;">New free quote request</h2>
+<p style="margin-top:16px;padding:14px 16px;background:#f8fafc;border-radius:10px;border:1px solid #e2e8f0;">
+  <strong>{{client_name}}</strong><br />
+  {{client_email}} · {{client_phone}}<br />
+  <span style="color:#64748b;">Service:</span> {{service_type}} ({{property_summary}})<br />
+  <span style="color:#64748b;">Postcode:</span> {{postcode}}<br />
+  <span style="color:#64748b;">Estimate:</span> {{price_line}}
+</p>
+<p>Reply quickly while they're still deciding. <a href="{{admin_url}}" style="color:{{brand_primary}};font-weight:700;">Open Quote Requests</a></p>`,
+  },
+  {
+    name: 'client_reschedule_confirmed',
+    subject: 'Booking {{booking_id}} moved to {{service_date}} at {{service_time}}',
+    description: 'Sent to the client when they move their own booking from the portal or app.',
+    variables: ['client_name', 'booking_id', 'service_type', 'old_date', 'old_time', 'service_date', 'service_time', 'job_address', 'portal_url', 'brand_name', 'brand_primary', 'footer_note'],
+    body: `<p>Hi {{client_name}},</p>
+<p>Done: your booking <strong>{{booking_id}}</strong> has been moved.</p>
+<p style="margin-top:16px;padding:14px 16px;background:#f8fafc;border-radius:10px;border:1px solid #e2e8f0;">
+  <strong>{{service_type}}</strong><br />
+  <span style="color:#94a3b8;text-decoration:line-through;">{{old_date}} at {{old_time}}</span><br />
+  <span style="color:#0f172a;">Now: <strong>{{service_date}} at {{service_time}}</strong></span><br />
+  <span style="color:#64748b;">{{job_address}}</span>
+</p>
+<p>You can move a booking yourself up to 24 hours before it starts. <a href="{{portal_url}}" style="color:{{brand_primary}};font-weight:700;">View your booking</a></p>`,
+  },
+  {
+    name: 'admin_booking_rescheduled_alert',
+    subject: '{{client_name}} moved {{booking_id}} to {{service_date}} at {{service_time}}',
+    description: 'Sent to the business inbox when a client moves their own booking.',
+    variables: ['client_name', 'booking_id', 'service_type', 'old_date', 'old_time', 'service_date', 'service_time', 'team_line', 'admin_url', 'brand_name', 'brand_primary', 'footer_note'],
+    body: `<h2 style="margin:0 0 12px;color:#0f172a;font-size:18px;">Client moved a booking</h2>
+<p style="margin-top:16px;padding:14px 16px;background:#f8fafc;border-radius:10px;border:1px solid #e2e8f0;">
+  <strong>{{booking_id}}</strong> · {{service_type}} · {{client_name}}<br />
+  <span style="color:#94a3b8;text-decoration:line-through;">{{old_date}} at {{old_time}}</span><br />
+  <span style="color:#0f172a;">Now: <strong>{{service_date}} at {{service_time}}</strong></span>
+</p>
+<p>{{team_line}}</p>
+<p><a href="{{admin_url}}" style="color:{{brand_primary}};font-weight:700;">Open Job Assignment</a></p>`,
+  },
+  {
+    name: 'admin_staff_cancel_request_alert',
+    subject: '{{staff_name}} asked to drop booking {{booking_id}} ({{service_date}})',
+    description: 'Sent to the business inbox when a cleaner asks to be taken off a job.',
+    variables: ['staff_name', 'booking_id', 'client_name', 'service_date', 'service_time', 'reason', 'admin_url', 'brand_name', 'brand_primary', 'footer_note'],
+    body: `<h2 style="margin:0 0 12px;color:#0f172a;font-size:18px;">Cleaner cancellation request</h2>
+<p><strong>{{staff_name}}</strong> has asked to be taken off this job:</p>
+<p style="margin-top:16px;padding:14px 16px;background:#f8fafc;border-radius:10px;border:1px solid #e2e8f0;">
+  <strong>{{booking_id}}</strong> for {{client_name}}<br />
+  <span style="color:#0f172a;">{{service_date}}</span> at <strong>{{service_time}}</strong><br />
+  <span style="color:#64748b;">Reason:</span> {{reason}}
+</p>
+<p>Approve or reject it, then find cover in Job Assignment. <a href="{{admin_url}}" style="color:{{brand_primary}};font-weight:700;">Open the admin dashboard</a></p>`,
+  },
 ];
 
 export const DEFAULT_SMS_TEMPLATES: SmsTemplateSeed[] = [
@@ -411,5 +529,12 @@ export const DEFAULT_SMS_TEMPLATES: SmsTemplateSeed[] = [
     variables: ['brand_name', 'client_name', 'google_review_url'],
     message:
       'Hi {{client_name}}, thanks for choosing {{brand_name}}! We\'d love your feedback — leave a quick Google review: {{google_review_url}}',
+  },
+  {
+    name: 'staff_booking_rescheduled_sms',
+    description: 'Sent to assigned cleaners when admin changes the date or time of their job.',
+    variables: ['brand_name', 'staff_name', 'booking_id', 'old_date', 'old_time', 'service_date', 'service_time', 'job_address'],
+    message:
+      '{{brand_name}}: Hi {{staff_name}}, job {{booking_id}} has moved from {{old_date}} {{old_time}} to {{service_date}} at {{service_time}}. {{job_address}}',
   },
 ];
