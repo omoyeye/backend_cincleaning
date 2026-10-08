@@ -67,6 +67,16 @@ import {
 } from './bookingReminders';
 import { registerJobTrackingRoutes, runJobTrackingMonitor, trackingResetPatch } from './jobTracking';
 import { registerPushToken, unregisterPushToken } from './push';
+import { runColumnMigrations } from './migrations';
+import { registerStaffAssessmentRoutes } from './staffAssessments';
+import {
+    calculateHourlyPrice,
+    hourlyRateFor,
+    lookupPricingRegion,
+    type HourlyPriceBreakdown,
+    type PricingRegion,
+} from './shared/pricing';
+import { getServiceTrigger } from './shared/bookingHelpers';
 import { eq, desc, asc, sql, inArray, or, and, gte, lte } from 'drizzle-orm';
 import type { RowDataPacket } from 'mysql2';
 import bcrypt from 'bcryptjs';
@@ -1008,6 +1018,7 @@ const requireAdmin = (req: any, res: any): boolean => {
 };
 
 registerJobTrackingRoutes(app, db, authenticateToken, requireAdmin);
+registerStaffAssessmentRoutes(app, db, authenticateToken);
 
 // Get current user from token
 app.get('/api/me', authenticateToken, async (req: any, res: any) => {
@@ -1509,12 +1520,18 @@ app.patch('/api/admin/accounts/:id/menu-scope', authenticateToken, async (req: a
         const allowedTabs = [
             'overview',
             'bookings',
+            'quotes',
             'assignment',
             'rota',
+            'liveMap',
             'staff',
             'staffInvoices',
+            'performance',
+            'customerInvoices',
+            'expenses',
             'services',
             'marketing',
+            'reviews',
             'communication',
             'support',
             'settings',
@@ -1567,6 +1584,13 @@ app.patch('/api/referrals/:referralId', authenticateToken, async (req: any, res)
 });
 
 // Services
+/** Optional £ rate from admin input: positive number as a decimal string, anything else clears it (null). */
+function parseOptionalRate(v: unknown): string | null {
+    if (v === null || v === undefined || v === '') return null;
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? n.toFixed(2) : null;
+}
+
 app.get('/api/services', async (req, res) => {
     const results = await db.select().from(services);
     res.json(results);
@@ -1574,7 +1598,7 @@ app.get('/api/services', async (req, res) => {
 
 app.post('/api/services', authenticateToken, async (req: any, res) => {
     if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
-    const { name, description, baseRate, minDuration, minNotice, icon, pricingModel, active, callOutCharge, bookingFlow } = req.body || {};
+    const { name, description, baseRate, londonRate, minDuration, minNotice, icon, pricingModel, active, callOutCharge, bookingFlow } = req.body || {};
     if (!name || String(name).trim() === '') {
         return res.status(400).json({ error: 'Service name is required' });
     }
@@ -1608,6 +1632,7 @@ app.post('/api/services', authenticateToken, async (req: any, res) => {
             name: String(name).trim(),
             description: description != null ? String(description) : null,
             baseRate: String(baseRate),
+            londonRate: parseOptionalRate(londonRate),
             minDuration: md,
             minNotice: mn,
             callOutCharge: coVal,
@@ -1654,6 +1679,9 @@ app.patch('/api/services/:id', authenticateToken, async (req: any, res) => {
     if (Object.prototype.hasOwnProperty.call(req.body || {}, 'bookingFlow')) {
         const v = (req.body as Record<string, unknown>).bookingFlow;
         patch.bookingFlow = v == null ? null : sanitizeBookingFlowInput(v);
+    }
+    if (Object.prototype.hasOwnProperty.call(req.body || {}, 'londonRate')) {
+        patch.londonRate = parseOptionalRate((req.body as Record<string, unknown>).londonRate);
     }
     if (patch.baseRate !== undefined) patch.baseRate = String(patch.baseRate);
     if (patch.pricingModel !== undefined) {
@@ -2104,6 +2132,7 @@ app.post('/api/quote-lead', async (req, res) => {
             status: 'new',
         }).$returningId();
         const leadId = inserted[0]?.id;
+        broadcastSync('quotes');
 
         res.json({ ok: true, id: leadId });
     } catch (error) {
@@ -2188,6 +2217,7 @@ app.post('/api/quote-submit', async (req, res) => {
         } catch (notifyErr) {
             console.error('[quote-submit] admin notification failed:', notifyErr);
         }
+        broadcastSync('quotes');
 
         // 3. Email the visitor their estimate (the main purpose of collecting the address).
         try {
@@ -2270,12 +2300,53 @@ app.post('/api/quote-submit', async (req, res) => {
     }
 });
 
+const QUOTE_LEAD_STATUSES = ['new', 'contacted', 'converted', 'lost'];
+
 app.get('/api/admin/quote-leads', authenticateToken, async (req: any, res) => {
     if (!requireAdmin(req, res)) return;
     try {
-        const rows = await db.select().from(quoteLeads).orderBy(desc(quoteLeads.createdAt)).limit(200);
-        res.json(rows);
+        const rows = await db.select().from(quoteLeads).orderBy(desc(quoteLeads.createdAt)).limit(1000);
+
+        // Link each lead to bookings made with the same email, so admins can see who actually booked.
+        const emails = Array.from(new Set(rows.map((r) => String(r.email || '').trim().toLowerCase()).filter(Boolean)));
+        const bookingsByEmail = new Map<string, Array<{ id: number; bookingId: string | null; date: string; status: string | null; totalPrice: string | null; createdAt: Date | null }>>();
+        if (emails.length > 0) {
+            const matches = await db
+                .select({
+                    id: bookings.id,
+                    bookingId: bookings.bookingId,
+                    date: bookings.date,
+                    status: bookings.status,
+                    totalPrice: bookings.totalPrice,
+                    createdAt: bookings.createdAt,
+                    email: sql<string>`LOWER(TRIM(${bookings.contactEmail}))`,
+                })
+                .from(bookings)
+                .where(inArray(sql`LOWER(TRIM(${bookings.contactEmail}))`, emails))
+                .orderBy(asc(bookings.createdAt));
+            for (const m of matches) {
+                const list = bookingsByEmail.get(m.email) ?? [];
+                list.push(m);
+                bookingsByEmail.set(m.email, list);
+            }
+        }
+
+        res.json(rows.map((r) => {
+            const all = bookingsByEmail.get(String(r.email || '').trim().toLowerCase()) ?? [];
+            const leadAt = r.createdAt ? new Date(r.createdAt).getTime() : 0;
+            const after = all.filter((b) => (b.createdAt ? new Date(b.createdAt).getTime() : 0) >= leadAt);
+            const first = after[0];
+            return {
+                ...r,
+                matchedBooking: first
+                    ? { id: first.id, bookingId: first.bookingId, date: first.date, status: first.status, totalPrice: first.totalPrice }
+                    : null,
+                bookingsAfterQuote: after.length,
+                bookingsBeforeQuote: all.length - after.length,
+            };
+        }));
     } catch (error) {
+        console.error('[quote-leads] list error:', error);
         res.status(500).json({ error: 'Failed to fetch quote leads' });
     }
 });
@@ -2284,19 +2355,124 @@ app.patch('/api/admin/quote-leads/:id', authenticateToken, async (req: any, res)
     if (!requireAdmin(req, res)) return;
     try {
         const id = parseInt(req.params.id, 10);
-        const status = String(req.body?.status ?? '');
         if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid ID' });
-        if (!['new', 'contacted', 'converted', 'lost'].includes(status)) {
-            return res.status(400).json({ error: 'Invalid status' });
+        const updates: { status?: string; statusUpdatedAt?: Date; adminNotes?: string | null } = {};
+        if (req.body?.status !== undefined) {
+            const status = String(req.body.status);
+            if (!QUOTE_LEAD_STATUSES.includes(status)) return res.status(400).json({ error: 'Invalid status' });
+            updates.status = status;
+            updates.statusUpdatedAt = new Date();
         }
-        await db.update(quoteLeads).set({ status }).where(eq(quoteLeads.id, id));
+        if (req.body?.adminNotes !== undefined) {
+            const notes = String(req.body.adminNotes ?? '').trim().slice(0, 5000);
+            updates.adminNotes = notes || null;
+        }
+        if (Object.keys(updates).length === 0) return res.status(400).json({ error: 'Nothing to update' });
+        const existing = await db.select({ id: quoteLeads.id }).from(quoteLeads).where(eq(quoteLeads.id, id)).limit(1);
+        if (!existing.length) return res.status(404).json({ error: 'Quote request not found' });
+        await db.update(quoteLeads).set(updates).where(eq(quoteLeads.id, id));
+        broadcastSync('quotes');
         res.json({ message: 'Lead updated' });
     } catch (error) {
+        console.error('[quote-leads] update error:', error);
         res.status(500).json({ error: 'Failed to update lead' });
     }
 });
 
+app.delete('/api/admin/quote-leads/:id', authenticateToken, async (req: any, res) => {
+    if (!requireAdmin(req, res)) return;
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid ID' });
+        const existing = await db.select({ id: quoteLeads.id }).from(quoteLeads).where(eq(quoteLeads.id, id)).limit(1);
+        if (!existing.length) return res.status(404).json({ error: 'Quote request not found' });
+        await db.delete(quoteLeads).where(eq(quoteLeads.id, id));
+        broadcastSync('quotes');
+        res.json({ message: 'Lead deleted' });
+    } catch (error) {
+        console.error('[quote-leads] delete error:', error);
+        res.status(500).json({ error: 'Failed to delete lead' });
+    }
+});
+
 // Bookings
+type StandardBookingPrice = {
+    region: PricingRegion;
+    regionSource: string;
+    hourlyRate: number;
+    breakdown: HourlyPriceBreakdown;
+};
+
+/**
+ * Authoritative price for Standard (hourly) cleans: pricing region from the postcode, rates and extras from the
+ * database, discount re-validated with the same rules as /api/validate-discount. Other services return null
+ * and keep their existing behaviour.
+ */
+async function priceStandardBooking(bookingData: any): Promise<StandardBookingPrice | null> {
+    const serviceRows = await db.select().from(services);
+    const hint = String(bookingData?.serviceType ?? '').trim().toLowerCase();
+    const svc = serviceRows.find(
+        (s) => String(s.id) === String(bookingData?.serviceType ?? '') || String(s.name || '').trim().toLowerCase() === hint,
+    );
+    if (!svc) return null;
+    const trigger = getServiceTrigger({ id: String(svc.id), name: svc.name, bookingFlow: svc.bookingFlow } as any);
+    if (trigger !== 'standard') return null;
+
+    const lookup = await lookupPricingRegion(bookingData?.address?.postcode);
+    const region: PricingRegion = lookup?.region ?? 'standard';
+    const hourlyRate = hourlyRateFor({ baseRate: svc.baseRate, londonRate: svc.londonRate }, region);
+
+    const minHours = Number(svc.minDuration) > 0 ? Number(svc.minDuration) : 2;
+    const requested =
+        durationHoursFromUnknown(bookingData?.duration) ?? durationHoursFromUnknown(bookingData?.propertyDetails?.duration);
+    const hours = Math.max(minHours, requested ?? minHours);
+
+    const extraRows = await db.select().from(extraServices);
+    const extras = (Array.isArray(bookingData?.extras) ? bookingData.extras : [])
+        .map((item: { id?: unknown; quantity?: unknown }) => {
+            const row = extraRows.find((e) => String(e.id) === String(item?.id));
+            return row ? { price: row.price, quantity: Number(item?.quantity) || 0 } : null;
+        })
+        .filter(Boolean) as Array<{ price: string; quantity: number }>;
+
+    let discount: { type: string; value: string } | null = null;
+    const code = String(bookingData?.discountCode ?? '').trim();
+    if (code) {
+        const [d] = await db.select().from(discounts).where(eq(discounts.code, code)).limit(1);
+        const usable =
+            d &&
+            d.isActive &&
+            !(d.expiresAt && new Date(d.expiresAt) < new Date()) &&
+            !(d.usageLimit !== null && (d.usedCount ?? 0) >= d.usageLimit);
+        if (usable) discount = { type: String(d.type), value: String(d.value) };
+    }
+
+    const base = {
+        hourlyRate,
+        hours,
+        extras,
+        cleaningMaterials: bookingData?.propertyDetails?.cleaningMaterials ?? null,
+        discount,
+    };
+    const tipRaw = Number(bookingData?.tipAmount);
+    let tipAmount: number;
+    if (bookingData?.tipAmount !== undefined && bookingData?.tipAmount !== null && Number.isFinite(tipRaw)) {
+        tipAmount = Math.max(0, tipRaw);
+    } else {
+        // Older clients fold the tip into totalPrice: anything above the correct price is the customer's tip.
+        const withoutTip = calculateHourlyPrice(base);
+        const clientTotal = Number(bookingData?.totalPrice);
+        tipAmount = Number.isFinite(clientTotal) ? Math.max(0, clientTotal - withoutTip.total) : 0;
+    }
+
+    return {
+        region,
+        regionSource: lookup?.source ?? 'none',
+        hourlyRate,
+        breakdown: calculateHourlyPrice({ ...base, tip: { amount: tipAmount } }),
+    };
+}
+
 app.post('/api/bookings', async (req, res) => {
     try {
         const bookingData = req.body;
@@ -2323,6 +2499,21 @@ app.post('/api/bookings', async (req, res) => {
             return res.status(400).json({
                 error: 'Please confirm acceptance of deposit and payment terms before completing your booking.',
             });
+        }
+
+        // Standard cleans: the server's price is what gets saved (the client's total is quietly corrected).
+        const serverPrice = await priceStandardBooking(bookingData);
+        if (serverPrice) {
+            const correctTotal = serverPrice.breakdown.total.toFixed(2);
+            const clientTotal = Number(bookingData.totalPrice);
+            if (!Number.isFinite(clientTotal) || Math.round(clientTotal * 100) !== serverPrice.breakdown.pence.total) {
+                console.warn(
+                    `[pricing] Standard booking total corrected from ${bookingData.totalPrice} to ${correctTotal} ` +
+                    `(${serverPrice.region} via ${serverPrice.regionSource}, £${serverPrice.hourlyRate.toFixed(2)}/h x ${serverPrice.breakdown.hours}h)`,
+                );
+            }
+            bookingData.totalPrice = correctTotal;
+            bookingData.discountAmount = serverPrice.breakdown.discount.toFixed(2);
         }
 
         // Handle Discount & Points Calculation
@@ -2463,6 +2654,8 @@ app.post('/api/bookings', async (req, res) => {
                 discountAmount: discountAmount.toString(),
                 pointsEarned: pointsToEarn,
                 depositTermsAcceptedAt: new Date(),
+                priceRegion: serverPrice?.region ?? null,
+                hourlyRate: serverPrice ? serverPrice.hourlyRate.toFixed(2) : null,
             })
             .$returningId();
         const numericBookingId = Number(insertedRows[0]?.id);
@@ -2480,13 +2673,18 @@ app.post('/api/bookings', async (req, res) => {
             });
         }
 
-        // Notify Admins
-        await db.insert(notifications).values({
-            userId: 1,
-            type: 'booking_update',
-            message: `New Booking Request: ${publicBookingId}`,
-            isRead: false
-        });
+        // Notify every admin account (never assume a fixed user id; a missing one would fail the whole request).
+        const adminIdsForNewBooking = await getAdminUserIds();
+        if (adminIdsForNewBooking.length) {
+            await db.insert(notifications).values(
+                adminIdsForNewBooking.map((userId) => ({
+                    userId,
+                    type: 'booking_update',
+                    message: `New Booking Request: ${publicBookingId}`,
+                    isRead: false,
+                })),
+            );
+        }
 
         // Multi-Staff Assignment
         if (bookingData.assignedStaffIds && Array.isArray(bookingData.assignedStaffIds)) {
@@ -4069,6 +4267,24 @@ app.get('/api/staff', authenticateToken, async (req: any, res) => {
         return res.status(403).json({ error: 'Unauthorized' });
     }
     const results = await db.select().from(staff);
+    if (req.user.role === 'staff') {
+        // Colleagues' contact, address and bank details are private: cleaners get their own full record only.
+        return res.json(results.map((s) => (Number(s.userId) === Number(req.user.id)
+            ? s
+            : { id: s.id, userId: s.userId, name: s.name, role: s.role, status: s.status, imageUrl: s.imageUrl, email: '' })));
+    }
+    if (req.user.role === 'admin') {
+        // "Working with us since": the date the cleaner's login account was created.
+        const userIds = results.map((s) => Number(s.userId)).filter((id) => Number.isFinite(id) && id > 0);
+        const joined = userIds.length
+            ? await db.select({ id: users.id, createdAt: users.createdAt }).from(users).where(inArray(users.id, userIds))
+            : [];
+        const joinedById = new Map(joined.map((u) => [Number(u.id), u.createdAt]));
+        return res.json(results.map((s) => {
+            const at = joinedById.get(Number(s.userId));
+            return { ...s, joinedAt: at ? new Date(at as unknown as string).toISOString() : null };
+        }));
+    }
     if (req.user.role === 'customer') {
         // Expose only assignment-safe public staff fields to client portal.
         return res.json(results.map((s) => ({
@@ -4587,31 +4803,38 @@ app.patch('/api/invoices/:id', authenticateToken, async (req: any, res) => {
     try {
         const id = parseInt(req.params.id, 10);
         const { status, adminNotes } = req.body || {};
-        if (!status || !['Approved', 'Rejected', 'Pending'].includes(String(status))) {
+        // Status is optional so a note can be added or corrected on its own.
+        if (status !== undefined && !['Approved', 'Rejected', 'Pending'].includes(String(status))) {
             return res.status(400).json({ error: 'Invalid status' });
+        }
+        if (status === undefined && adminNotes === undefined) {
+            return res.status(400).json({ error: 'Nothing to update' });
         }
         const existing = await db.select().from(staffInvoices).where(eq(staffInvoices.id, id)).limit(1);
         if (!existing.length) return res.status(404).json({ error: 'Invoice not found' });
 
-        await db
-            .update(staffInvoices)
-            .set({
-                status: String(status),
-                adminNotes: adminNotes != null ? String(adminNotes) : null,
-            })
-            .where(eq(staffInvoices.id, id));
+        const patch: { status?: string; adminNotes?: string | null } = {};
+        if (status !== undefined) patch.status = String(status);
+        if (adminNotes !== undefined) patch.adminNotes = cleanInvoiceNote(adminNotes);
+        await db.update(staffInvoices).set(patch).where(eq(staffInvoices.id, id));
 
         const staffIdForInvoice = Number(existing[0].staffId);
         const staffRow = await db.select().from(staff).where(eq(staff.id, staffIdForInvoice)).limit(1);
         const staffUserId = Number(staffRow[0]?.userId || 0);
-        if (staffUserId > 0 && (String(status) === 'Approved' || String(status) === 'Rejected')) {
-            const note = adminNotes != null && String(adminNotes).trim()
-                ? ` Note: ${String(adminNotes).trim()}`
-                : '';
+        const statusChanged = status !== undefined && String(status) !== existing[0].status;
+        if (staffUserId > 0 && statusChanged && (String(status) === 'Approved' || String(status) === 'Rejected')) {
+            const note = patch.adminNotes ? ` Note: ${patch.adminNotes}` : '';
             await db.insert(notifications).values({
                 userId: staffUserId,
                 type: 'system',
                 message: `Your weekly invoice (${existing[0].weekLabel || 'current week'}) was ${String(status).toLowerCase()} by admin.${note}`,
+                isRead: false,
+            });
+        } else if (staffUserId > 0 && !statusChanged && patch.adminNotes && patch.adminNotes !== existing[0].adminNotes) {
+            await db.insert(notifications).values({
+                userId: staffUserId,
+                type: 'system',
+                message: `Admin added a note to your weekly invoice (${existing[0].weekLabel || 'current week'}): ${patch.adminNotes}`,
                 isRead: false,
             });
         }
@@ -4621,6 +4844,37 @@ app.patch('/api/invoices/:id', authenticateToken, async (req: any, res) => {
     } catch (e) {
         console.error(e);
         res.status(500).json({ error: 'Failed to update invoice' });
+    }
+});
+
+app.delete('/api/invoices/:id', authenticateToken, async (req: any, res) => {
+    if (req.user.role !== 'admin') {
+        return res.status(403).json({ error: 'Admin only' });
+    }
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (Number.isNaN(id)) return res.status(400).json({ error: 'Invalid id' });
+        const existing = await db.select().from(staffInvoices).where(eq(staffInvoices.id, id)).limit(1);
+        if (!existing.length) return res.status(404).json({ error: 'Invoice not found' });
+        await db.delete(staffInvoices).where(eq(staffInvoices.id, id));
+
+        // Let the cleaner know, so they can resubmit a corrected invoice.
+        const staffRow = await db.select().from(staff).where(eq(staff.id, Number(existing[0].staffId))).limit(1);
+        const staffUserId = Number(staffRow[0]?.userId || 0);
+        if (staffUserId > 0) {
+            await db.insert(notifications).values({
+                userId: staffUserId,
+                type: 'system',
+                message: `Your weekly invoice (${existing[0].weekLabel || 'current week'}) was removed by admin. Please check your jobs and submit it again if needed.`,
+                isRead: false,
+            });
+        }
+
+        broadcastSync('all');
+        res.json({ message: 'Invoice deleted' });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: 'Failed to delete invoice' });
     }
 });
 
@@ -4714,6 +4968,19 @@ app.put('/api/direct-messages/read', authenticateToken, async (req: any, res) =>
 
 // ── Customer Invoices CRUD ──────────────────────────────────────────────
 
+/** Invoice notes are free text; trim, cap length, and store empty as null. */
+function cleanInvoiceNote(value: unknown): string | null {
+    const text = String(value ?? '').trim().slice(0, 2000);
+    return text || null;
+}
+
+/** Customer-facing note block for invoice emails (escaped, line breaks kept). */
+function invoiceNotesHtml(notes: string | null | undefined): string {
+    if (!notes || !String(notes).trim()) return '';
+    const safe = escapeHtmlBasic(String(notes)).replace(/\n/g, '<br />');
+    return `<div style="margin-top:20px;padding:16px;background:#f8fafc;border-radius:8px;font-size:13px;color:#475569;"><strong>Notes:</strong><br />${safe}</div>`;
+}
+
 async function nextInvoiceNumber(): Promise<string> {
     const [rows] = await poolConnection.query(
         `SELECT invoice_number FROM customer_invoices ORDER BY id DESC LIMIT 1`
@@ -4741,7 +5008,7 @@ app.get('/api/customer-invoices', authenticateToken, async (req: any, res) => {
 app.post('/api/customer-invoices', authenticateToken, async (req: any, res) => {
     if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
     try {
-        const { customerName, customerEmail, customerPhone, bookingId, customerId, items, subtotal, vatRate, vatAmount, total, notes, dueDate, status } = req.body;
+        const { customerName, customerEmail, customerPhone, bookingId, customerId, items, subtotal, vatRate, vatAmount, total, notes, adminNotes, dueDate, status } = req.body;
         if (!customerName || !items || !Array.isArray(items) || items.length === 0) {
             return res.status(400).json({ error: 'Customer name and at least one line item required' });
         }
@@ -4759,7 +5026,8 @@ app.post('/api/customer-invoices', authenticateToken, async (req: any, res) => {
             vatAmount: String(vatAmount),
             total: String(total),
             status: status || 'draft',
-            notes: notes ? String(notes) : null,
+            notes: cleanInvoiceNote(notes),
+            adminNotes: cleanInvoiceNote(adminNotes),
             dueDate: dueDate ? String(dueDate) : null,
             createdBy: Number(req.user.id),
         }).$returningId();
@@ -4793,7 +5061,7 @@ app.patch('/api/customer-invoices/:id', authenticateToken, async (req: any, res)
         const existing = await db.select().from(customerInvoices).where(eq(customerInvoices.id, id)).limit(1);
         if (!existing.length) return res.status(404).json({ error: 'Invoice not found' });
 
-        const { customerName, customerEmail, customerPhone, items, subtotal, vatRate, vatAmount, total, notes, dueDate, status } = req.body;
+        const { customerName, customerEmail, customerPhone, items, subtotal, vatRate, vatAmount, total, notes, adminNotes, dueDate, status } = req.body;
         const patch: Record<string, any> = {};
         if (customerName !== undefined) patch.customerName = String(customerName).slice(0, 255);
         if (customerEmail !== undefined) patch.customerEmail = customerEmail ? String(customerEmail).slice(0, 255) : null;
@@ -4803,7 +5071,8 @@ app.patch('/api/customer-invoices/:id', authenticateToken, async (req: any, res)
         if (vatRate !== undefined) patch.vatRate = String(vatRate);
         if (vatAmount !== undefined) patch.vatAmount = String(vatAmount);
         if (total !== undefined) patch.total = String(total);
-        if (notes !== undefined) patch.notes = notes ? String(notes) : null;
+        if (notes !== undefined) patch.notes = cleanInvoiceNote(notes);
+        if (adminNotes !== undefined) patch.adminNotes = cleanInvoiceNote(adminNotes);
         if (dueDate !== undefined) patch.dueDate = dueDate ? String(dueDate) : null;
         if (status !== undefined) patch.status = String(status);
         if (status === 'paid') patch.paidAt = new Date();
@@ -4822,6 +5091,8 @@ app.delete('/api/customer-invoices/:id', authenticateToken, async (req: any, res
     try {
         const id = parseInt(req.params.id, 10);
         if (Number.isNaN(id)) return res.status(400).json({ error: 'Invalid id' });
+        const existing = await db.select({ id: customerInvoices.id }).from(customerInvoices).where(eq(customerInvoices.id, id)).limit(1);
+        if (!existing.length) return res.status(404).json({ error: 'Invoice not found' });
         await db.delete(customerInvoices).where(eq(customerInvoices.id, id));
         broadcastSync('all');
         res.json({ message: 'Invoice deleted' });
@@ -4848,7 +5119,7 @@ app.get('/api/customer-invoices/:id/preview', authenticateToken, async (req: any
         const hasRate = lineItems.some((li: any) => li.hourlyRate);
 
         const itemsHtml = lineItems.map((li: any) => {
-            let row = `<tr><td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">${li.description || ''}`;
+            let row = `<tr><td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">${escapeHtmlBasic(String(li.description || ''))}`;
             if (li.hourlyRate && !hasRate) row += `<br/><span style="font-size:12px;color:#64748b;">&pound;${Number(li.hourlyRate).toFixed(2)}/hr</span>`;
             row += `</td>`;
             row += `<td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;">${li.quantity ?? 1}</td>`;
@@ -4859,7 +5130,7 @@ app.get('/api/customer-invoices/:id/preview', authenticateToken, async (req: any
             return row;
         }).join('');
 
-        const invoiceInnerHtml = `<p>Hi ${inv.customerName},</p>
+        const invoiceInnerHtml = `<p>Hi ${escapeHtmlBasic(String(inv.customerName || ''))},</p>
 <p>Please find your invoice below.</p>
 <div style="background:#f0fdfa;border-radius:12px;padding:18px 20px;margin:20px 0;border:1px solid #99f6e4;">
   <p style="margin:0 0 6px;font-weight:700;color:#0f172a;">Invoice ${inv.invoiceNumber}</p>
@@ -4882,7 +5153,7 @@ app.get('/api/customer-invoices/:id/preview', authenticateToken, async (req: any
   <tr><td></td><td style="text-align:right;padding:4px 12px;">VAT (${Number(inv.vatRate).toFixed(0)}%): <strong>&pound;${Number(inv.vatAmount).toFixed(2)}</strong></td></tr>
   <tr><td></td><td style="text-align:right;padding:8px 12px;font-size:18px;border-top:2px solid ${brandVars.brand_primary || '#0d9488'};"><strong>Total: &pound;${Number(inv.total).toFixed(2)}</strong></td></tr>
 </table>
-${inv.notes ? `<div style="margin-top:20px;padding:16px;background:#f8fafc;border-radius:8px;font-size:13px;color:#475569;"><strong>Notes:</strong> ${inv.notes}</div>` : ''}
+${invoiceNotesHtml(inv.notes)}
 ${inv.stripePaymentUrl && inv.status !== 'paid' ? `<div style="text-align:center;margin:28px 0 12px;">
   <a href="${inv.stripePaymentUrl}" style="display:inline-block;padding:14px 40px;background:${brandVars.brand_primary || '#7c3aed'};color:#ffffff;font-size:16px;font-weight:700;text-decoration:none;border-radius:10px;">Pay Now &mdash; &pound;${Number(inv.total).toFixed(2)}</a>
 </div>` : ''}
@@ -4921,7 +5192,7 @@ app.post('/api/customer-invoices/:id/send', authenticateToken, async (req: any, 
             const hasRate = lineItems.some((li: any) => li.hourlyRate);
 
             const itemsHtml = lineItems.map((li: any) => {
-                let row = `<tr><td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">${li.description || ''}`;
+                let row = `<tr><td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">${escapeHtmlBasic(String(li.description || ''))}`;
                 if (li.hourlyRate && !hasRate) row += `<br/><span style="font-size:12px;color:#64748b;">&pound;${Number(li.hourlyRate).toFixed(2)}/hr</span>`;
                 row += `</td>`;
                 row += `<td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:center;">${li.quantity ?? 1}</td>`;
@@ -4932,7 +5203,7 @@ app.post('/api/customer-invoices/:id/send', authenticateToken, async (req: any, 
                 return row;
             }).join('');
 
-            const invoiceInnerHtml = `<p>Hi ${inv.customerName},</p>
+            const invoiceInnerHtml = `<p>Hi ${escapeHtmlBasic(String(inv.customerName || ''))},</p>
 <p>Please find your invoice below.</p>
 <div style="background:#f0fdfa;border-radius:12px;padding:18px 20px;margin:20px 0;border:1px solid #99f6e4;">
   <p style="margin:0 0 6px;font-weight:700;color:#0f172a;">Invoice ${inv.invoiceNumber}</p>
@@ -4955,7 +5226,7 @@ app.post('/api/customer-invoices/:id/send', authenticateToken, async (req: any, 
   <tr><td></td><td style="text-align:right;padding:4px 12px;">VAT (${Number(inv.vatRate).toFixed(0)}%): <strong>&pound;${Number(inv.vatAmount).toFixed(2)}</strong></td></tr>
   <tr><td></td><td style="text-align:right;padding:8px 12px;font-size:18px;border-top:2px solid ${brandVars.brand_primary || '#0d9488'};"><strong>Total: &pound;${Number(inv.total).toFixed(2)}</strong></td></tr>
 </table>
-${inv.notes ? `<div style="margin-top:20px;padding:16px;background:#f8fafc;border-radius:8px;font-size:13px;color:#475569;"><strong>Notes:</strong> ${inv.notes}</div>` : ''}
+${invoiceNotesHtml(inv.notes)}
 ${inv.stripePaymentUrl && inv.status !== 'paid' ? `<div style="text-align:center;margin:28px 0 12px;">
   <a href="${inv.stripePaymentUrl}" style="display:inline-block;padding:14px 40px;background:${brandVars.brand_primary || '#7c3aed'};color:#ffffff;font-size:16px;font-weight:700;text-decoration:none;border-radius:10px;">Pay Now &mdash; &pound;${Number(inv.total).toFixed(2)}</a>
 </div>` : ''}
@@ -5081,7 +5352,7 @@ app.get('/api/my-invoices', authenticateToken, async (req: any, res) => {
         const rows = await db.select().from(customerInvoices)
             .where(eq(customerInvoices.customerId, req.user.id))
             .orderBy(desc(customerInvoices.createdAt));
-        res.json(rows.filter(r => r.status !== 'draft'));
+        res.json(rows.filter(r => r.status !== 'draft').map(({ adminNotes: _private, ...r }) => r));
     } catch (e: any) {
         console.error('My invoices error:', e?.message || e);
         res.status(500).json({ error: 'Failed to fetch invoices' });
@@ -6876,21 +7147,7 @@ async function startServer() {
         // await ensureMessageTemplatesSeededOnce(db);
         await loadBrevoConfigFromDb(db);
 
-        // Idempotent column migrations (Stripe + job tracking)
-        for (const col of [
-            'ALTER TABLE `customer_invoices` ADD COLUMN `stripe_payment_intent_id` VARCHAR(255) DEFAULT NULL',
-            'ALTER TABLE `customer_invoices` ADD COLUMN `stripe_payment_url` VARCHAR(500) DEFAULT NULL',
-            'ALTER TABLE `bookings` ADD COLUMN `en_route_at` TIMESTAMP NULL DEFAULT NULL',
-            'ALTER TABLE `bookings` ADD COLUMN `cleaner_location` JSON NULL',
-            'ALTER TABLE `bookings` ADD COLUMN `late_notices` JSON NULL',
-            'ALTER TABLE `bookings` ADD COLUMN `on_the_way_prompt_sent_at` TIMESTAMP NULL DEFAULT NULL',
-            'ALTER TABLE `bookings` ADD COLUMN `no_en_route_warning_sent_at` TIMESTAMP NULL DEFAULT NULL',
-            'ALTER TABLE `bookings` ADD COLUMN `unassigned_warning_sent_at` TIMESTAMP NULL DEFAULT NULL',
-        ]) {
-            try { await db.execute(sql.raw(col)); } catch (e: any) {
-                if (!String(e?.message).includes('Duplicate column')) console.warn('Column migration:', e?.message);
-            }
-        }
+        await runColumnMigrations();
 
         // The first-time-visitor popup advertises FIRST10, so the code must exist.
         try {

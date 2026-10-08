@@ -14,7 +14,7 @@ export function attachRealtime(server: Server): void {
 }
 
 /** Notify all connected dashboards / portals to refetch from the DB. */
-export function broadcastSync(scope: 'bookings' | 'notifications' | 'location' | 'all' = 'all'): void {
+export function broadcastSync(scope: 'bookings' | 'notifications' | 'location' | 'quotes' | 'all' = 'all'): void {
   const msg = JSON.stringify({ type: 'nn_sync', scope, t: Date.now() });
   for (const ws of clients) {
     if (ws.readyState === WebSocket.OPEN) {

@@ -39,6 +39,8 @@ export const services = mysqlTable('services', {
     id: int().primaryKey().autoincrement(),
     name: varchar('name', { length: 255 }).notNull(),
     baseRate: decimal('base_rate', { precision: 10, scale: 2 }).notNull(),
+    /** Hourly rate for Greater London postcodes (Standard cleaning); null = same as baseRate everywhere. */
+    londonRate: decimal('london_rate', { precision: 10, scale: 2 }),
     pricingModel: varchar('pricing_model', { length: 50 }).default('hourly'), // hourly, flat, size_based, room_based, quote
     minDuration: int('min_duration').default(2),
     minNotice: int('min_notice').default(2), // days
@@ -124,6 +126,11 @@ export const bookings = mysqlTable('bookings', {
     paymentFeeEvidence: json('payment_fee_evidence'),
     /** When the post-completion Google review request was sent (email/SMS/in-app). */
     reviewRequestSentAt: timestamp('review_request_sent_at'),
+
+    /** Pricing region worked out from the postcode at booking time ('london' | 'standard'). */
+    priceRegion: varchar('price_region', { length: 20 }),
+    /** Hourly rate actually charged for hourly services, so invoices never depend on today's service rate. */
+    hourlyRate: decimal('hourly_rate', { precision: 10, scale: 2 }),
 
     /** When an assigned cleaner tapped "Start travel" for this job. */
     enRouteAt: timestamp('en_route_at'),
@@ -283,7 +290,10 @@ export const customerInvoices = mysqlTable('customer_invoices', {
     vatAmount: decimal('vat_amount', { precision: 10, scale: 2 }).notNull(),
     total: decimal('total', { precision: 10, scale: 2 }).notNull(),
     status: varchar('status', { length: 20 }).notNull().default('draft'),
+    /** Shown to the customer on the invoice and in the invoice email. */
     notes: text('notes'),
+    /** Private admin note, never shown to the customer. */
+    adminNotes: text('admin_notes'),
     dueDate: varchar('due_date', { length: 20 }),
     paidAt: timestamp('paid_at'),
     sentAt: timestamp('sent_at'),
@@ -293,6 +303,21 @@ export const customerInvoices = mysqlTable('customer_invoices', {
     createdBy: int('created_by'),
     createdAt: timestamp('created_at').defaultNow(),
     updatedAt: timestamp('updated_at').defaultNow(),
+});
+
+/** Supervisor / admin on-the-job assessments of a cleaner (optionally tied to a booking). */
+export const staffAssessments = mysqlTable('staff_assessments', {
+    id: int().primaryKey().autoincrement(),
+    staffId: int('staff_id').notNull().references(() => staff.id),
+    bookingId: int('booking_id').references(() => bookings.id),
+    assessorUserId: int('assessor_user_id'),
+    assessorName: varchar('assessor_name', { length: 255 }).notNull(),
+    rating: int('rating').notNull(), // overall 1-5
+    punctuality: int('punctuality'), // 1-5, optional
+    quality: int('quality'), // 1-5, optional
+    professionalism: int('professionalism'), // 1-5, optional
+    remark: text('remark').notNull(),
+    createdAt: timestamp('created_at').defaultNow(),
 });
 
 export const staffCancelRequests = mysqlTable('staff_cancel_requests', {
@@ -337,6 +362,10 @@ export const quoteLeads = mysqlTable('quote_leads', {
     /** new | contacted | converted | lost — set by admin */
     status: varchar('status', { length: 20 }).notNull().default('new'),
     brevoSynced: boolean('brevo_synced').notNull().default(false),
+    /** Private admin notes (call outcome, follow-up date, etc.). */
+    adminNotes: text('admin_notes'),
+    /** When the status last changed, so admins can see how long a lead has waited. */
+    statusUpdatedAt: timestamp('status_updated_at'),
     createdAt: timestamp('created_at').defaultNow(),
 });
 

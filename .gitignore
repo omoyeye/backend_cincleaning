@@ -11,6 +11,10 @@ deploy/
 uploads/
 tmp/
 
+# Local database dumps (contain personal data)
+db-backups/
+*.sql.gz
+
 *.log
 .DS_Store
 Thumbs.db
