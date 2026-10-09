@@ -275,7 +275,8 @@ export const staffInvoices = mysqlTable('staff_invoices', {
     id: int().primaryKey().autoincrement(),
     staffId: int('staff_id').references(() => staff.id),
     staffName: varchar('staff_name', { length: 255 }),
-    weekLabel: varchar('week_label', { length: 20 }).notNull(),
+    /** e.g. '2026-10-05 → 2026-10-11' (was 20 chars, which rejected the label the portals send). */
+    weekLabel: varchar('week_label', { length: 60 }).notNull(),
     weekStart: varchar('week_start', { length: 20 }),
     weekEnd: varchar('week_end', { length: 20 }),
     totalAmount: decimal('total_amount', { precision: 10, scale: 2 }).notNull(),

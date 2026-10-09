@@ -67,6 +67,34 @@ const TABLE_MIGRATIONS = [
     )`,
 ];
 
+/**
+ * Staff edited before the login-sync fix kept their old login email. Point each login at the email
+ * admin set on the staff profile, unless another account already uses it. Safe to run on every boot.
+ */
+async function syncStaffLoginEmails(): Promise<void> {
+    try {
+        const [result] = await poolConnection.query(
+            `UPDATE users u
+             JOIN staff s ON s.user_id = u.id
+             SET u.email = LOWER(TRIM(s.email))
+             WHERE s.email IS NOT NULL AND TRIM(s.email) <> ''
+               AND LOWER(TRIM(s.email)) <> u.email
+               AND NOT EXISTS (SELECT 1 FROM (SELECT email FROM users) taken WHERE taken.email = LOWER(TRIM(s.email)))
+               AND NOT EXISTS (SELECT 1 FROM superadmins sa WHERE sa.email = LOWER(TRIM(s.email)))`,
+        );
+        const changed = Number((result as { affectedRows?: number }).affectedRows || 0);
+        if (changed > 0) console.log(`[migrations] Synced ${changed} staff login email(s) to their staff profile.`);
+    } catch (e: any) {
+        console.warn('[migrations] staff login email sync skipped:', e?.message);
+    }
+}
+
+/** Column changes that are safe to repeat on every boot (widening only). */
+const MODIFY_MIGRATIONS = [
+    // Weekly invoice labels like "2026-10-05 → 2026-10-11" are 23 characters; the old limit was 20.
+    "ALTER TABLE `staff_invoices` MODIFY COLUMN `week_label` VARCHAR(60) NOT NULL",
+];
+
 export async function runColumnMigrations(): Promise<void> {
     for (const statement of TABLE_MIGRATIONS) {
         try {
@@ -75,6 +103,14 @@ export async function runColumnMigrations(): Promise<void> {
             console.warn('Table migration failed:', statement.slice(0, 60), '-', e?.message);
         }
     }
+    for (const statement of MODIFY_MIGRATIONS) {
+        try {
+            await poolConnection.query(statement);
+        } catch (e: any) {
+            console.warn('Modify migration failed:', statement, '-', e?.message);
+        }
+    }
+    await syncStaffLoginEmails();
     for (const statement of COLUMN_MIGRATIONS) {
         try {
             await poolConnection.query(statement);

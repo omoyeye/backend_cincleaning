@@ -4867,12 +4867,67 @@ app.put('/api/staff/:id', authenticateToken, async (req: any, res) => {
             }
         }
 
-        if (password) {
-            const newPw = String(password);
-            if (newPw.length < 8) {
-                return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+        // The staff login is the linked users row: keep its email/name in step with what admin edits,
+        // otherwise the cleaner is told their new details but can only sign in with the old email.
+        const isAdminEdit = req.user.role === 'admin';
+        const linkedUserId = Number(staffRec[0].userId) || 0;
+        const linkedUser = linkedUserId
+            ? (await db.select().from(users).where(eq(users.id, linkedUserId)).limit(1))[0]
+            : undefined;
+        let loginEmail: string | null = null;
+        if (isAdminEdit && details.email !== undefined && (String(details.email ?? '').trim() || linkedUser)) {
+            const nextEmail = String(details.email ?? '').trim().toLowerCase();
+            if (!isPlausibleEmail(nextEmail)) {
+                return res.status(400).json({ error: 'Please enter a valid email address.' });
             }
-            const targetUserId = Number(staffRec[0].userId);
+            const currentLoginEmail = String(linkedUser?.email ?? '').trim().toLowerCase();
+            if (nextEmail !== currentLoginEmail) {
+                const takenByUser = await db.select({ id: users.id }).from(users).where(eq(users.email, nextEmail)).limit(1);
+                const takenBySuper = await db.select({ id: superadmins.id }).from(superadmins).where(eq(superadmins.email, nextEmail)).limit(1);
+                if ((takenByUser.length && Number(takenByUser[0].id) !== linkedUserId) || takenBySuper.length) {
+                    return res.status(400).json({ error: 'Another account already uses this email. Choose a different one.' });
+                }
+            }
+            loginEmail = nextEmail;
+            details.email = nextEmail;
+        }
+        if (password && String(password).length < 8) {
+            return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+        }
+
+        if (isAdminEdit && linkedUser) {
+            const userPatch: Record<string, unknown> = {};
+            if (loginEmail && loginEmail !== String(linkedUser.email ?? '').trim().toLowerCase()) userPatch.email = loginEmail;
+            if (details.name !== undefined && String(details.name).trim() && String(details.name).trim() !== linkedUser.name) {
+                userPatch.name = String(details.name).trim();
+            }
+            if (details.phone !== undefined) userPatch.phone = details.phone ? String(details.phone).trim() : null;
+            if (Object.keys(userPatch).length) {
+                await db.update(users).set(userPatch as any).where(eq(users.id, linkedUserId));
+            }
+        }
+
+        // A staff profile without a login (e.g. older records) gets one as soon as admin sets a password.
+        if (isAdminEdit && !linkedUser && password) {
+            const email = loginEmail || String(staffRec[0].email ?? '').trim().toLowerCase();
+            if (!isPlausibleEmail(email)) {
+                return res.status(400).json({ error: 'Add an email address before setting a password.' });
+            }
+            const clash = await db.select({ id: users.id }).from(users).where(eq(users.email, email)).limit(1);
+            if (clash.length) {
+                return res.status(400).json({ error: 'Another account already uses this email. Choose a different one.' });
+            }
+            const created = await db.insert(users).values({
+                email,
+                passwordHash: await bcrypt.hash(String(password), 10),
+                name: String(details.name ?? staffRec[0].name ?? 'Staff'),
+                role: 'staff',
+                isVerified: true,
+            } as any).$returningId();
+            await db.update(staff).set({ userId: created[0].id } as any).where(eq(staff.id, staffId));
+        } else if (password) {
+            const newPw = String(password);
+            const targetUserId = linkedUserId;
             // Staff self-updates must verify current password. Admins can reset without it.
             if (req.user.role !== 'admin') {
                 if (!currentPassword || typeof currentPassword !== 'string') {
@@ -5095,29 +5150,6 @@ app.post('/api/staff/:id/invoice', authenticateToken, async (req: any, res) => {
         const [staffRow] = await db.select().from(staff).where(eq(staff.id, staffId)).limit(1);
         const staffName = staffRow?.name ?? `Staff #${staffId}`;
 
-        const settingsMap = await loadBusinessSettingsMap(db);
-        const adminTo = adminInvoiceRecipientEmail(settingsMap);
-        const tableHtml = weeklyInvoiceJobTableHtml(jobListForEmail);
-        const brand = await loadBrandVars(db);
-        const { subject, html } = await renderTransactionalEmail(db, 'staff_weekly_invoice_admin', {
-            ...brand,
-            staff_name: staffName,
-            staff_id: String(staffId),
-            week: String(week || ''),
-            total_amount: Number(totalAmount || 0).toFixed(2),
-            hours_sum: Number(hoursSum || 0).toFixed(2),
-            job_count: String(jobCount),
-            bank_name: bankDetails?.bankName || 'Not provided',
-            account_number: bankDetails?.accountNumber || 'Not provided',
-            sort_code: bankDetails?.sortCode || 'Not provided',
-            job_table_html: tableHtml,
-        });
-        await sendEmail({
-            to: [{ email: adminTo, name: 'Payroll' }],
-            subject,
-            htmlContent: html,
-        });
-
         await db.insert(staffInvoices).values({
             staffId,
             staffName,
@@ -5131,6 +5163,34 @@ app.post('/api/staff/:id/invoice', authenticateToken, async (req: any, res) => {
             bankJson: bankDetails ?? null,
             status: 'Pending',
         });
+
+        // Save first: a failed email must never lose the invoice.
+        try {
+            const settingsMap = await loadBusinessSettingsMap(db);
+            const adminTo = adminInvoiceRecipientEmail(settingsMap);
+            const tableHtml = weeklyInvoiceJobTableHtml(jobListForEmail);
+            const brand = await loadBrandVars(db);
+            const { subject, html } = await renderTransactionalEmail(db, 'staff_weekly_invoice_admin', {
+                ...brand,
+                staff_name: staffName,
+                staff_id: String(staffId),
+                week: String(week || ''),
+                total_amount: Number(totalAmount || 0).toFixed(2),
+                hours_sum: Number(hoursSum || 0).toFixed(2),
+                job_count: String(jobCount),
+                bank_name: bankDetails?.bankName || 'Not provided',
+                account_number: bankDetails?.accountNumber || 'Not provided',
+                sort_code: bankDetails?.sortCode || 'Not provided',
+                job_table_html: tableHtml,
+            });
+            await sendEmail({
+                to: [{ email: adminTo, name: 'Payroll' }],
+                subject,
+                htmlContent: html,
+            });
+        } catch (mailErr) {
+            console.error('[staff invoice] admin email failed (invoice saved):', mailErr);
+        }
 
         const adminIds = await getAdminUserIds();
         if (adminIds.length > 0) {
