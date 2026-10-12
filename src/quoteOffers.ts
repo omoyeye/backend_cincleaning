@@ -408,10 +408,43 @@ export function registerQuoteOfferRoutes(app: Express, db: any, deps: Deps): voi
     });
 
     /** Create a quote for a lead. Pass send: true to email it straight away. */
-    app.post('/api/admin/quote-leads/:id/quotes', authenticateToken, async (req: any, res) => {
+    /** Admin starts a quote from the page header: record the client as a request so it lists with the rest. */
+    app.post('/api/admin/quotes', authenticateToken, async (req: any, res) => {
         if (!requireAdmin(req, res)) return;
         try {
-            const leadId = Number(req.params.id);
+            const email = String(req.body?.clientEmail || '').trim().toLowerCase();
+            if (!validEmail(email)) return res.status(400).json({ error: 'Client email looks invalid.' });
+            const parsed = parseQuote(req.body);
+            if ('error' in parsed) return res.status(400).json({ error: parsed.error });
+            const prop = parsed.details?.property || {};
+            const inserted = await db.insert(quoteLeads).values({
+                firstName: parsed.clientName,
+                email,
+                phone: parsed.clientPhone,
+                postcode: parsed.postcode,
+                serviceType: parsed.serviceType || 'Custom quote',
+                bedrooms: prop.bedrooms != null && Number(prop.bedrooms) > 0 ? String(prop.bedrooms) : null,
+                bathrooms: prop.bathrooms != null && Number(prop.bathrooms) > 0 ? String(prop.bathrooms) : null,
+                priceEstimate: money(parsed.total),
+                status: 'contacted',
+                statusUpdatedAt: new Date(),
+                adminNotes: 'Quote started by the office (not from the website form).',
+            });
+            const leadId = Number((inserted as any)?.[0]?.insertId ?? (inserted as any)?.insertId);
+            await createQuote(req, res, leadId);
+        } catch (e: any) {
+            console.error('[quotes] create standalone', e?.message || e);
+            res.status(500).json({ error: 'Failed to create quote' });
+        }
+    });
+
+    app.post('/api/admin/quote-leads/:id/quotes', authenticateToken, async (req: any, res) => {
+        if (!requireAdmin(req, res)) return;
+        await createQuote(req, res, Number(req.params.id));
+    });
+
+    async function createQuote(req: any, res: any, leadId: number) {
+        try {
             const [lead] = await db.select().from(quoteLeads).where(eq(quoteLeads.id, leadId)).limit(1);
             if (!lead) return res.status(404).json({ error: 'Quote request not found' });
             const parsed = parseQuote(req.body);
@@ -464,7 +497,7 @@ export function registerQuoteOfferRoutes(app: Express, db: any, deps: Deps): voi
             console.error('[quotes] create', e?.message || e);
             res.status(500).json({ error: 'Failed to create quote' });
         }
-    });
+    }
 
     /** Edit a quote's content or status. */
     app.patch('/api/admin/quotes/:quoteId', authenticateToken, async (req: any, res) => {

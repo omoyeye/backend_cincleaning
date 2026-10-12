@@ -112,6 +112,9 @@ export const bookings = mysqlTable('bookings', {
     chatClosedAt: timestamp('chat_closed_at'),
 
     /** Admin marks client invoice as paid (shown on customer invoice view). */
+    /** When and how much the client paid by card for this booking (deposit link), for weekly reports. */
+    depositPaidAt: timestamp('deposit_paid_at'),
+    depositPaidAmount: decimal('deposit_paid_amount', { precision: 10, scale: 2 }),
     invoicePaid: boolean('invoice_paid').notNull().default(false),
     adminNotes: text('admin_notes'),
     stripePaymentLink: text('stripe_payment_link'),
@@ -418,6 +421,22 @@ export const quoteOffers = mysqlTable('quote_offers', {
     createdBy: varchar('created_by', { length: 160 }),
     createdAt: timestamp('created_at').defaultNow(),
     updatedAt: timestamp('updated_at').defaultNow(),
+});
+
+/** Saved business reports: the weekly Monday report and any range an admin generates. Figures are a fixed snapshot. */
+export const businessReports = mysqlTable('business_reports', {
+    id: int().primaryKey().autoincrement(),
+    /** weekly | custom */
+    kind: varchar('kind', { length: 20 }).notNull().default('weekly'),
+    periodStart: varchar('period_start', { length: 10 }).notNull(),
+    periodEnd: varchar('period_end', { length: 10 }).notNull(),
+    data: json('data').notNull(),
+    /** { summary, watchOut[], actions[] } written by AI from the figures only. */
+    ai: json('ai'),
+    aiModel: varchar('ai_model', { length: 60 }),
+    emailedAt: timestamp('emailed_at'),
+    createdBy: varchar('created_by', { length: 160 }),
+    generatedAt: timestamp('generated_at').defaultNow(),
 });
 
 /** Admin expense tracker entries (receipts, purchases, business costs). */

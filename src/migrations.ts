@@ -6,6 +6,8 @@ import { poolConnection } from './db';
  */
 const COLUMN_MIGRATIONS = [
     'ALTER TABLE `users` ADD COLUMN `marketing_opt_in` BOOLEAN DEFAULT FALSE',
+    'ALTER TABLE `bookings` ADD COLUMN `deposit_paid_at` TIMESTAMP NULL DEFAULT NULL',
+    'ALTER TABLE `bookings` ADD COLUMN `deposit_paid_amount` DECIMAL(10,2) NULL',
     // quote_offers columns added after the first version of the table.
     'ALTER TABLE `quote_offers` ADD COLUMN `client_phone` VARCHAR(50) NULL',
     'ALTER TABLE `quote_offers` ADD COLUMN `client_address` TEXT NULL',
@@ -44,6 +46,20 @@ const ON_COLUMN_CREATED: Record<string, string[]> = {
 
 /** Tables added after first deploy (created only if missing). */
 const TABLE_MIGRATIONS = [
+    `CREATE TABLE IF NOT EXISTS \`business_reports\` (
+        \`id\` INT NOT NULL AUTO_INCREMENT,
+        \`kind\` VARCHAR(20) NOT NULL DEFAULT 'weekly',
+        \`period_start\` VARCHAR(10) NOT NULL,
+        \`period_end\` VARCHAR(10) NOT NULL,
+        \`data\` JSON NOT NULL,
+        \`ai\` JSON NULL,
+        \`ai_model\` VARCHAR(60) NULL,
+        \`emailed_at\` TIMESTAMP NULL DEFAULT NULL,
+        \`created_by\` VARCHAR(160) NULL,
+        \`generated_at\` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (\`id\`),
+        KEY \`idx_business_reports_period\` (\`kind\`, \`period_start\`)
+    )`,
     `CREATE TABLE IF NOT EXISTS \`quote_offers\` (
         \`id\` INT NOT NULL AUTO_INCREMENT,
         \`lead_id\` INT NULL,

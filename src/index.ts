@@ -83,6 +83,7 @@ import { runColumnMigrations } from './migrations';
 import { registerStaffAssessmentRoutes } from './staffAssessments';
 import { registerStaffPerformanceRoutes } from './staffPerformance';
 import { registerQuoteOfferRoutes } from './quoteOffers';
+import { registerBusinessReportRoutes, startWeeklyReportSchedule } from './businessReports';
 import {
     calculateHourlyPrice,
     hourlyRateFor,
@@ -941,7 +942,11 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
         if (bookingId) {
             try {
                 const before = await db.select().from(bookings).where(eq(bookings.id, Number(bookingId))).limit(1);
-                await db.update(bookings).set({ invoicePaid: true }).where(eq(bookings.id, Number(bookingId)));
+                const already = await db.select({ paid: bookings.invoicePaid }).from(bookings).where(eq(bookings.id, Number(bookingId))).limit(1);
+                await db
+                    .update(bookings)
+                    .set(already[0]?.paid ? { invoicePaid: true } : { invoicePaid: true, depositPaidAt: new Date(), depositPaidAmount: amountPaid.toFixed(2) })
+                    .where(eq(bookings.id, Number(bookingId)));
                 console.log(`[stripe] Booking #${bookingId} deposit marked paid via webhook`);
                 broadcastSync('all');
                 const b = before[0];
@@ -1333,6 +1338,11 @@ registerJobTrackingRoutes(app, db, authenticateToken, requireAdmin);
 registerStaffAssessmentRoutes(app, db, authenticateToken);
 registerStaffPerformanceRoutes(app, db, authenticateToken);
 registerQuoteOfferRoutes(app, db, { authenticateToken, requireAdmin, broadcastSync, absoluteSiteUrl });
+const notifyAdminsAboutReport = async (message: string) => {
+    await notifyUsers(db, await listAdminUserIds(db), { message, pushTitle: 'Weekly report' });
+    broadcastSync('notifications');
+};
+registerBusinessReportRoutes(app, db, { authenticateToken, requireAdmin, absoluteSiteUrl, notifyAdmins: notifyAdminsAboutReport });
 
 // Get current user from token
 app.get('/api/me', authenticateToken, async (req: any, res: any) => {
@@ -4462,7 +4472,10 @@ app.get('/api/pay/booking/:id', async (req, res) => {
 
         const pi = await stripe.paymentIntents.retrieve((b as any).stripePaymentIntentId);
         if (pi.status === 'succeeded') {
-            await db.update(bookings).set({ invoicePaid: true }).where(eq(bookings.id, id));
+            await db
+                .update(bookings)
+                .set({ invoicePaid: true, depositPaidAt: new Date(), depositPaidAmount: ((Number(pi.amount_received || pi.amount) || 0) / 100).toFixed(2) })
+                .where(eq(bookings.id, id));
             return res.json({ paid: true, bookingRef: String(b.bookingId ?? b.id) });
         }
 
@@ -7726,6 +7739,7 @@ async function startServer() {
         }
     };
     setInterval(() => void runTrackingMonitor(''), 5 * 60 * 1000);
+    startWeeklyReportSchedule(db, { absoluteSiteUrl, notifyAdmins: notifyAdminsAboutReport });
     setTimeout(() => void runTrackingMonitor(' startup'), 60_000);
 
     const REMINDER_MS = 15 * 60 * 1000;

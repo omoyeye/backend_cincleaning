@@ -428,6 +428,24 @@ export const DEFAULT_EMAIL_TEMPLATES: EmailTemplateSeed[] = [
 <p style="font-size:13px;color:#64748b;">Prices are in GBP. If anything about the job changes, let us know and we will update your quote.</p>`,
   },
   {
+    name: 'admin_weekly_report',
+    subject: 'Weekly report {{period_label}}: £{{money_received}} received, {{jobs_completed}} jobs done',
+    description: 'Sent to the business inbox every Monday with the previous week figures and the AI summary.',
+    variables: ['period_label', 'money_received', 'jobs_completed', 'kpi_table', 'ai_summary', 'next_week_line', 'report_url', 'brand_name', 'brand_primary', 'footer_note'],
+    body: `<h2 style="margin:0 0 4px;color:#0f172a;font-size:20px;">Weekly business report</h2>
+<p style="margin:0 0 16px;color:#64748b;">{{period_label}}</p>
+<div style="padding:14px 16px;border-radius:12px;border:1px solid #e2e8f0;background:#ffffff;">
+  {{kpi_table}}
+  <p style="margin:10px 0 0;font-size:12px;color:#64748b;">Arrows compare with the week before.</p>
+</div>
+{{ai_summary}}
+<p style="margin-top:16px;color:#334155;"><strong>Next week:</strong> {{next_week_line}}</p>
+<p style="text-align:center;margin:24px 0;">
+  <a href="{{report_url}}" style="display:inline-block;background:{{brand_primary}};color:#ffffff;font-weight:700;text-decoration:none;padding:12px 24px;border-radius:10px;">Open the full report</a>
+</p>
+<p style="font-size:12px;color:#64748b;">Figures come straight from your bookings, invoices, expenses and quotes. Open Reports in the admin dashboard for the full breakdown.</p>`,
+  },
+  {
     name: 'client_reschedule_confirmed',
     subject: 'Booking {{booking_id}} moved to {{service_date}} at {{service_time}}',
     description: 'Sent to the client when they move their own booking from the portal or app.',
