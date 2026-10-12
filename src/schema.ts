@@ -18,6 +18,8 @@ export const users = mysqlTable('users', {
     /** Optional UK postcode (uppercase, canonical spaced form). */
     postcode: varchar('postcode', { length: 20 }),
     imageUrl: text('image_url'),
+    /** Promotions and offers by email/SMS (UK GDPR opt-in; set in the app or website settings). */
+    marketingOptIn: boolean('marketing_opt_in').default(false),
     /** Optional menu-level scope for non-superadmin admins. Empty/null => full admin UI. */
     adminTabs: json('admin_tabs'),
     resetToken: varchar('reset_token', { length: 255 }),
@@ -380,6 +382,42 @@ export const quoteLeads = mysqlTable('quote_leads', {
     /** When the status last changed, so admins can see how long a lead has waited. */
     statusUpdatedAt: timestamp('status_updated_at'),
     createdAt: timestamp('created_at').defaultNow(),
+});
+
+/** Formal quotes the office builds from a quote request and emails to the client. */
+export const quoteOffers = mysqlTable('quote_offers', {
+    id: int().primaryKey().autoincrement(),
+    leadId: int('lead_id').references(() => quoteLeads.id, { onDelete: 'cascade' }),
+    quoteNumber: varchar('quote_number', { length: 40 }),
+    clientName: varchar('client_name', { length: 160 }),
+    clientEmail: varchar('client_email', { length: 160 }).notNull(),
+    clientPhone: varchar('client_phone', { length: 50 }),
+    clientAddress: text('client_address'),
+    postcode: varchar('postcode', { length: 12 }),
+    /** e.g. "3 bed, 2 bath, house" */
+    propertySummary: varchar('property_summary', { length: 255 }),
+    serviceType: varchar('service_type', { length: 160 }),
+    /** [{ description, detail?, quantity, unitPrice, lineTotal }] */
+    items: json('items'),
+    /** How the price was built: service, rate, hours, property, add-ons (same data as invoices). */
+    details: json('details'),
+    subtotal: decimal('subtotal', { precision: 10, scale: 2 }).notNull().default('0'),
+    discount: decimal('discount', { precision: 10, scale: 2 }).notNull().default('0'),
+    vatRate: decimal('vat_rate', { precision: 5, scale: 2 }).notNull().default('0'),
+    vatAmount: decimal('vat_amount', { precision: 10, scale: 2 }).notNull().default('0'),
+    total: decimal('total', { precision: 10, scale: 2 }).notNull().default('0'),
+    /** Message shown to the client above the prices. */
+    message: text('message'),
+    /** Instructions shown under the prices (what is included, access, materials, payment terms...). */
+    notes: text('notes'),
+    validUntil: varchar('valid_until', { length: 20 }),
+    /** draft | sent | accepted | declined */
+    status: varchar('status', { length: 20 }).notNull().default('draft'),
+    sentAt: timestamp('sent_at'),
+    sentCount: int('sent_count').notNull().default(0),
+    createdBy: varchar('created_by', { length: 160 }),
+    createdAt: timestamp('created_at').defaultNow(),
+    updatedAt: timestamp('updated_at').defaultNow(),
 });
 
 /** Admin expense tracker entries (receipts, purchases, business costs). */

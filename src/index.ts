@@ -28,6 +28,7 @@ import {
     bookingReminderLog,
     promotions,
     quoteLeads,
+    quoteOffers,
     directMessages,
     expenses,
 } from './schema';
@@ -80,6 +81,8 @@ import {
 } from './notify';
 import { runColumnMigrations } from './migrations';
 import { registerStaffAssessmentRoutes } from './staffAssessments';
+import { registerStaffPerformanceRoutes } from './staffPerformance';
+import { registerQuoteOfferRoutes } from './quoteOffers';
 import {
     calculateHourlyPrice,
     hourlyRateFor,
@@ -295,6 +298,9 @@ function toPublicSessionUser(row: Record<string, unknown>, isSuperadmin: boolean
     if ('postcode' in row) {
         const pc = row.postcode;
         out.postcode = pc != null && String(pc).trim() ? String(pc) : null;
+    }
+    if ('marketingOptIn' in row || 'marketing_opt_in' in row) {
+        out.marketingOptIn = Boolean((row as { marketingOptIn?: unknown }).marketingOptIn ?? (row as { marketing_opt_in?: unknown }).marketing_opt_in);
     }
     if ('adminTabs' in row || 'admin_tabs' in row) {
         const raw = (row as { adminTabs?: unknown; admin_tabs?: unknown }).adminTabs
@@ -1260,7 +1266,7 @@ app.post('/api/account/delete', authenticateToken, async (req: any, res: any) =>
             await sendEmail({
                 to: [{ email: 'info@cleanitneatly.com' }],
                 subject: `GDPR Account Deletion Request - User #${userId}`,
-                htmlContent: `<p>User #${userId} (${userEmail}) has requested account deletion via the app on ${new Date().toISOString()}. All personal data must be erased within 30 days per UK GDPR Article 17.</p><p>Action required: delete user record, associated bookings PII, chat messages, and any other personal data.</p>`,
+                htmlContent: `<p>User #${userId} (${userEmail}) has requested account deletion via the app or website on ${new Date().toISOString()}. All personal data must be erased within 30 days per UK GDPR Article 17.</p><p>Action required: delete user record, associated bookings PII, chat messages, and any other personal data.</p>`,
             });
         } catch {}
 
@@ -1269,7 +1275,7 @@ app.post('/api/account/delete', authenticateToken, async (req: any, res: any) =>
                 await sendEmail({
                     to: [{ email: userEmail }],
                     subject: 'Account Deletion Request Received - CiN Cleaning',
-                    htmlContent: `<p>We have received your request to delete your account and personal data. This will be processed within 30 days as required by UK GDPR.</p><p>If you did not make this request, please contact us immediately at info@cleanitneatly.com.</p>`,
+                    htmlContent: `<p>We have received your request to delete your account and personal data. This will be processed within 30 days as required by UK GDPR.</p><p>If you did not make this request, please contact us immediately at support@cleanitneatly.com.</p>`,
                 });
             } catch {}
         }
@@ -1291,7 +1297,7 @@ app.post('/api/account/data-export', authenticateToken, async (req: any, res: an
             await sendEmail({
                 to: [{ email: 'info@cleanitneatly.com' }],
                 subject: `GDPR Subject Access Request - User #${userId}`,
-                htmlContent: `<p>User #${userId} (${userEmail}) has submitted a Subject Access Request (SAR) via the app on ${new Date().toISOString()}. A copy of their personal data must be provided within 30 days per UK GDPR Article 15.</p><p>Data to include: user profile, booking history, chat messages, payment records, notification preferences, referral data.</p>`,
+                htmlContent: `<p>User #${userId} (${userEmail}) has submitted a Subject Access Request (SAR) via the app or website on ${new Date().toISOString()}. A copy of their personal data must be provided within 30 days per UK GDPR Article 15.</p><p>Data to include: user profile, booking history, chat messages, payment records, notification preferences, referral data.</p>`,
             });
         } catch {}
 
@@ -1300,7 +1306,7 @@ app.post('/api/account/data-export', authenticateToken, async (req: any, res: an
                 await sendEmail({
                     to: [{ email: userEmail }],
                     subject: 'Data Export Request Received - CiN Cleaning',
-                    htmlContent: `<p>We have received your Subject Access Request. A copy of your personal data will be sent to this email address within 30 days as required by UK GDPR.</p><p>If you did not make this request, please contact us at info@cleanitneatly.com.</p>`,
+                    htmlContent: `<p>We have received your Subject Access Request. A copy of your personal data will be sent to this email address within 30 days as required by UK GDPR.</p><p>If you did not make this request, please contact us at support@cleanitneatly.com.</p>`,
                 });
             } catch {}
         }
@@ -1325,6 +1331,8 @@ const requireAdmin = (req: any, res: any): boolean => {
 
 registerJobTrackingRoutes(app, db, authenticateToken, requireAdmin);
 registerStaffAssessmentRoutes(app, db, authenticateToken);
+registerStaffPerformanceRoutes(app, db, authenticateToken);
+registerQuoteOfferRoutes(app, db, { authenticateToken, requireAdmin, broadcastSync, absoluteSiteUrl });
 
 // Get current user from token
 app.get('/api/me', authenticateToken, async (req: any, res: any) => {
@@ -1450,6 +1458,9 @@ app.patch('/api/users/:id', authenticateToken, async (req: any, res) => {
             const imgUrl = payload.imageUrl != null ? String(payload.imageUrl).trim() : '';
             patch.imageUrl = imgUrl || null;
         }
+        if (hasOwn('marketingOptIn')) {
+            patch.marketingOptIn = payload.marketingOptIn === true || payload.marketingOptIn === 'true' || payload.marketingOptIn === 1;
+        }
 
         // Optional password change. Self-updates must verify current password first.
         if (hasOwn('password') && payload.password) {
@@ -1481,7 +1492,8 @@ app.patch('/api/users/:id', authenticateToken, async (req: any, res) => {
         await db.update(users).set(patch as any).where(eq(users.id, userId));
         const [updated] = await db.select().from(users).where(eq(users.id, userId)).limit(1);
         if (!updated) return res.status(404).json({ error: 'User not found' });
-        const { passwordHash, ...safeUser } = updated;
+        // Never send the password hash or a pending reset token back.
+        const { passwordHash, resetToken, resetTokenExpiry, ...safeUser } = updated;
         res.json(safeUser);
     } catch (error) {
         console.error('Update user profile error:', error);
@@ -2647,7 +2659,25 @@ app.get('/api/admin/quote-leads', authenticateToken, async (req: any, res) => {
             }
         }
 
+        // Latest quote the office sent (or drafted) for each request.
+        const leadIds = rows.map((r) => Number(r.id));
+        const quotes = leadIds.length
+            ? await db
+                .select({ leadId: quoteOffers.leadId, quoteNumber: quoteOffers.quoteNumber, status: quoteOffers.status, total: quoteOffers.total, sentAt: quoteOffers.sentAt, createdAt: quoteOffers.createdAt })
+                .from(quoteOffers)
+                .where(inArray(quoteOffers.leadId, leadIds))
+                .orderBy(desc(quoteOffers.createdAt))
+            : [];
+        const quotesByLead = new Map<number, typeof quotes>();
+        for (const q of quotes) {
+            const list = quotesByLead.get(Number(q.leadId)) ?? [];
+            list.push(q);
+            quotesByLead.set(Number(q.leadId), list);
+        }
+
         res.json(rows.map((r) => {
+            const leadQuotes = quotesByLead.get(Number(r.id)) ?? [];
+            const latest = leadQuotes[0];
             const all = bookingsByEmail.get(String(r.email || '').trim().toLowerCase()) ?? [];
             const leadAt = r.createdAt ? new Date(r.createdAt).getTime() : 0;
             const after = all.filter((b) => (b.createdAt ? new Date(b.createdAt).getTime() : 0) >= leadAt);
@@ -2659,6 +2689,15 @@ app.get('/api/admin/quote-leads', authenticateToken, async (req: any, res) => {
                     : null,
                 bookingsAfterQuote: after.length,
                 bookingsBeforeQuote: all.length - after.length,
+                quoteCount: leadQuotes.length,
+                latestQuote: latest
+                    ? {
+                        quoteNumber: latest.quoteNumber,
+                        status: latest.status,
+                        total: Number(latest.total),
+                        sentAt: latest.sentAt ? new Date(latest.sentAt).toISOString() : null,
+                    }
+                    : null,
             };
         }));
     } catch (error) {

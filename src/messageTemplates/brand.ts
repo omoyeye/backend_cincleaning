@@ -63,8 +63,11 @@ export async function loadBrandVars(db: any): Promise<Record<string, string>> {
   let primary = (map.theme_primary || map.primaryColor || '#0d9488').trim();
   if (primary && !primary.startsWith('#')) primary = `#${primary}`;
 
-  const base = sitePublicUrl();
-  const brand_logo_url = base ? `${base}/brand-logo.png` : '';
+  // Logo: uploaded logo URL, else the site's brand-logo.png (site URL from env, else the Website setting).
+  const uploaded = String(map.logoUrl || '').trim();
+  const website = String(map.website || '').trim().replace(/\/$/, '');
+  const base = sitePublicUrl() || (website ? (website.startsWith('http') ? website : `https://${website}`) : '');
+  const brand_logo_url = /^https?:\/\//i.test(uploaded) ? uploaded : base ? `${base}/brand-logo.png` : '';
   const contact_block = buildContactBlockHtml(map);
   const brand_phone = (map.phone || '').trim();
 

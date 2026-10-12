@@ -407,6 +407,27 @@ export const DEFAULT_EMAIL_TEMPLATES: EmailTemplateSeed[] = [
 <p>Reply quickly while they're still deciding. <a href="{{admin_url}}" style="color:{{brand_primary}};font-weight:700;">Open Quote Requests</a></p>`,
   },
   {
+    name: 'client_quote',
+    subject: 'Your cleaning quote {{quote_number}} from {{brand_name}}: £{{quote_total}}',
+    description: 'Sent to a client when the office emails a quote from Quote Requests.',
+    variables: ['client_name', 'quote_number', 'quote_date', 'service_type', 'quote_header', 'customer_block', 'quote_table', 'quote_total', 'valid_until', 'personal_message', 'quote_notes', 'book_url', 'brand_phone', 'brand_name', 'brand_primary', 'footer_note'],
+    body: `{{quote_header}}
+<p>Hi {{client_name}},</p>
+<p>Thank you for asking us to quote. Here is your quote for <strong>{{service_type}}</strong>.</p>
+{{personal_message}}
+{{customer_block}}
+<div style="margin-top:16px;padding:16px;background:#f8fafc;border-radius:12px;border:1px solid #e2e8f0;">
+  <p style="margin:0 0 10px;color:#64748b;font-size:13px;">Quote <strong style="color:#0f172a;">{{quote_number}}</strong> · issued {{quote_date}} · valid until {{valid_until}}</p>
+  {{quote_table}}
+</div>
+{{quote_notes}}
+<p style="margin-top:20px;">Happy to go ahead? Book online in a couple of minutes, or simply reply to this email or call us on {{brand_phone}} and we will arrange everything for you.</p>
+<p style="text-align:center;margin:24px 0;">
+  <a href="{{book_url}}" style="display:inline-block;background:{{brand_primary}};color:#ffffff;font-weight:700;text-decoration:none;padding:13px 26px;border-radius:10px;">Book this clean</a>
+</p>
+<p style="font-size:13px;color:#64748b;">Prices are in GBP. If anything about the job changes, let us know and we will update your quote.</p>`,
+  },
+  {
     name: 'client_reschedule_confirmed',
     subject: 'Booking {{booking_id}} moved to {{service_date}} at {{service_time}}',
     description: 'Sent to the client when they move their own booking from the portal or app.',

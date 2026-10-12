@@ -5,6 +5,14 @@ import { poolConnection } from './db';
  * Runs on server start and before seeding; "duplicate column" errors mean it is already applied.
  */
 const COLUMN_MIGRATIONS = [
+    'ALTER TABLE `users` ADD COLUMN `marketing_opt_in` BOOLEAN DEFAULT FALSE',
+    // quote_offers columns added after the first version of the table.
+    'ALTER TABLE `quote_offers` ADD COLUMN `client_phone` VARCHAR(50) NULL',
+    'ALTER TABLE `quote_offers` ADD COLUMN `client_address` TEXT NULL',
+    'ALTER TABLE `quote_offers` ADD COLUMN `postcode` VARCHAR(12) NULL',
+    'ALTER TABLE `quote_offers` ADD COLUMN `property_summary` VARCHAR(255) NULL',
+    'ALTER TABLE `quote_offers` ADD COLUMN `notes` TEXT NULL',
+    'ALTER TABLE `quote_offers` ADD COLUMN `details` JSON NULL',
     'ALTER TABLE `customer_invoices` ADD COLUMN `stripe_payment_intent_id` VARCHAR(255) DEFAULT NULL',
     'ALTER TABLE `customer_invoices` ADD COLUMN `stripe_payment_url` VARCHAR(500) DEFAULT NULL',
     'ALTER TABLE `bookings` ADD COLUMN `en_route_at` TIMESTAMP NULL DEFAULT NULL',
@@ -36,6 +44,37 @@ const ON_COLUMN_CREATED: Record<string, string[]> = {
 
 /** Tables added after first deploy (created only if missing). */
 const TABLE_MIGRATIONS = [
+    `CREATE TABLE IF NOT EXISTS \`quote_offers\` (
+        \`id\` INT NOT NULL AUTO_INCREMENT,
+        \`lead_id\` INT NULL,
+        \`quote_number\` VARCHAR(40) NULL,
+        \`client_name\` VARCHAR(160) NULL,
+        \`client_email\` VARCHAR(160) NOT NULL,
+        \`client_phone\` VARCHAR(50) NULL,
+        \`client_address\` TEXT NULL,
+        \`postcode\` VARCHAR(12) NULL,
+        \`property_summary\` VARCHAR(255) NULL,
+        \`service_type\` VARCHAR(160) NULL,
+        \`items\` JSON NULL,
+        \`details\` JSON NULL,
+        \`subtotal\` DECIMAL(10,2) NOT NULL DEFAULT 0,
+        \`discount\` DECIMAL(10,2) NOT NULL DEFAULT 0,
+        \`vat_rate\` DECIMAL(5,2) NOT NULL DEFAULT 0,
+        \`vat_amount\` DECIMAL(10,2) NOT NULL DEFAULT 0,
+        \`total\` DECIMAL(10,2) NOT NULL DEFAULT 0,
+        \`message\` TEXT NULL,
+        \`notes\` TEXT NULL,
+        \`valid_until\` VARCHAR(20) NULL,
+        \`status\` VARCHAR(20) NOT NULL DEFAULT 'draft',
+        \`sent_at\` TIMESTAMP NULL DEFAULT NULL,
+        \`sent_count\` INT NOT NULL DEFAULT 0,
+        \`created_by\` VARCHAR(160) NULL,
+        \`created_at\` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        \`updated_at\` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (\`id\`),
+        KEY \`idx_quote_offers_lead\` (\`lead_id\`),
+        CONSTRAINT \`fk_quote_offers_lead\` FOREIGN KEY (\`lead_id\`) REFERENCES \`quote_leads\` (\`id\`) ON DELETE CASCADE
+    )`,
     `CREATE TABLE IF NOT EXISTS \`push_tokens\` (
         \`id\` INT NOT NULL AUTO_INCREMENT,
         \`user_id\` INT NOT NULL,
