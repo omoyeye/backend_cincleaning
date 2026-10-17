@@ -8,6 +8,12 @@ const COLUMN_MIGRATIONS = [
     'ALTER TABLE `users` ADD COLUMN `marketing_opt_in` BOOLEAN DEFAULT FALSE',
     'ALTER TABLE `bookings` ADD COLUMN `deposit_paid_at` TIMESTAMP NULL DEFAULT NULL',
     'ALTER TABLE `bookings` ADD COLUMN `deposit_paid_amount` DECIMAL(10,2) NULL',
+    // Pay in full option and the balance after the clean.
+    "ALTER TABLE `bookings` ADD COLUMN `payment_choice` VARCHAR(10) NULL DEFAULT 'deposit'",
+    'ALTER TABLE `bookings` ADD COLUMN `paid_in_full_at` TIMESTAMP NULL DEFAULT NULL',
+    'ALTER TABLE `bookings` ADD COLUMN `balance_paid_amount` DECIMAL(10,2) NULL',
+    'ALTER TABLE `bookings` ADD COLUMN `stripe_balance_intent_id` VARCHAR(255) NULL',
+    'ALTER TABLE `bookings` ADD COLUMN `balance_request_sent_at` TIMESTAMP NULL DEFAULT NULL',
     // quote_offers columns added after the first version of the table.
     'ALTER TABLE `quote_offers` ADD COLUMN `client_phone` VARCHAR(50) NULL',
     'ALTER TABLE `quote_offers` ADD COLUMN `client_address` TEXT NULL',
@@ -35,6 +41,15 @@ const COLUMN_MIGRATIONS = [
 
 /** One-off data steps that run only when the column they depend on is created for the first time. */
 const ON_COLUMN_CREATED: Record<string, string[]> = {
+    // Bookings already paid in full by card (admin full-payment links) count as paid in full.
+    'ALTER TABLE `bookings` ADD COLUMN `paid_in_full_at` TIMESTAMP NULL DEFAULT NULL': [
+        `UPDATE \`bookings\` SET \`paid_in_full_at\` = \`deposit_paid_at\`
+         WHERE \`deposit_paid_amount\` IS NOT NULL AND \`deposit_paid_amount\` >= \`total_price\` - 0.01`,
+    ],
+    // Jobs finished before this feature existed never get a surprise balance request.
+    'ALTER TABLE `bookings` ADD COLUMN `balance_request_sent_at` TIMESTAMP NULL DEFAULT NULL': [
+        "UPDATE `bookings` SET `balance_request_sent_at` = NOW() WHERE `status` IN ('Completed', 'Cancelled')",
+    ],
     // London Standard/General cleaning is £20/hour (Manchester and everywhere else stays on the base rate).
     'ALTER TABLE `services` ADD COLUMN `london_rate` DECIMAL(10,2) NULL DEFAULT NULL': [
         `UPDATE \`services\` SET \`london_rate\` = 20.00

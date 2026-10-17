@@ -392,6 +392,25 @@ export const DEFAULT_EMAIL_TEMPLATES: EmailTemplateSeed[] = [
 <p style="font-size:14px;color:#64748b;">Keep this email as your receipt.</p>`,
   },
   {
+    name: 'client_balance_due',
+    subject: 'Your clean is done: balance of £{{balance}} due ({{booking_id}})',
+    description: 'Sent to the client after the job is marked complete when only the deposit has been paid.',
+    variables: ['client_name', 'booking_id', 'service_type', 'service_date', 'total', 'amount_paid', 'balance', 'pay_url', 'brand_name', 'brand_primary', 'footer_note'],
+    body: `<p>Hi {{client_name}},</p>
+<p>Your {{service_type}} on {{service_date}} has been completed. Thank you for choosing {{brand_name}}!</p>
+<p style="margin-top:16px;padding:14px 16px;background:#f8fafc;border-radius:10px;border:1px solid #e2e8f0;">
+  <span style="color:#64748b;">Booking total:</span> £{{total}}<br />
+  <span style="color:#64748b;">Deposit paid:</span> £{{amount_paid}}<br />
+  <span style="color:#64748b;">Balance due:</span> <strong style="font-size:20px;color:#0f172a;">£{{balance}}</strong><br />
+  <span style="color:#64748b;">Reference:</span> {{booking_id}}
+</p>
+<p style="text-align:center;margin:24px 0;">
+  <a href="{{pay_url}}" style="display:inline-block;background:{{brand_primary}};color:#ffffff;padding:14px 32px;border-radius:12px;font-weight:800;text-decoration:none;font-size:16px;">Pay £{{balance}} now</a>
+</p>
+<p style="font-size:13px;color:#64748b;">Or copy this link: {{pay_url}}</p>
+<p style="font-size:13px;color:#64748b;">If you have already paid by bank transfer or cash, please ignore this message.</p>`,
+  },
+  {
     name: 'admin_new_quote_alert',
     subject: 'New quote request: {{client_name}} ({{service_type}})',
     description: 'Sent to the business inbox when someone finishes the homepage free quote.',
@@ -568,6 +587,13 @@ export const DEFAULT_SMS_TEMPLATES: SmsTemplateSeed[] = [
     variables: ['brand_name', 'client_name', 'google_review_url'],
     message:
       'Hi {{client_name}}, thanks for choosing {{brand_name}}! We\'d love your feedback — leave a quick Google review: {{google_review_url}}',
+  },
+  {
+    name: 'client_balance_due_sms',
+    description: 'Sent to the client after the job is marked complete when only the deposit has been paid.',
+    variables: ['brand_name', 'client_name', 'booking_id', 'balance', 'pay_url'],
+    message:
+      '{{brand_name}}: Hi {{client_name}}, your clean ({{booking_id}}) is done, thank you! The balance of £{{balance}} is now due. Pay securely here: {{pay_url}}',
   },
   {
     name: 'staff_booking_rescheduled_sms',

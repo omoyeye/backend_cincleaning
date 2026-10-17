@@ -115,6 +115,14 @@ export const bookings = mysqlTable('bookings', {
     /** When and how much the client paid by card for this booking (deposit link), for weekly reports. */
     depositPaidAt: timestamp('deposit_paid_at'),
     depositPaidAmount: decimal('deposit_paid_amount', { precision: 10, scale: 2 }),
+    /** What the client chose when booking: 'deposit' (default) or 'full'. */
+    paymentChoice: varchar('payment_choice', { length: 10 }).default('deposit'),
+    /** When the whole booking total had been paid (paid in full up front, or the balance after the clean). */
+    paidInFullAt: timestamp('paid_in_full_at'),
+    balancePaidAmount: decimal('balance_paid_amount', { precision: 10, scale: 2 }),
+    stripeBalanceIntentId: varchar('stripe_balance_intent_id', { length: 255 }),
+    /** Balance request (email, SMS, push) sent after the clean; prevents sending twice. */
+    balanceRequestSentAt: timestamp('balance_request_sent_at'),
     invoicePaid: boolean('invoice_paid').notNull().default(false),
     adminNotes: text('admin_notes'),
     stripePaymentLink: text('stripe_payment_link'),

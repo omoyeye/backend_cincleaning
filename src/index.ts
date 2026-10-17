@@ -98,6 +98,15 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { randomBytes } from 'crypto';
 import Stripe from 'stripe';
+import {
+    depositPercentOf,
+    firstChargeAmount,
+    normalizeChoice,
+    paymentFieldsForViewer,
+    recordBookingPayment,
+    registerBookingPaymentRoutes,
+    runBalanceRequests,
+} from './bookingPayments';
 import rateLimit from 'express-rate-limit';
 
 const app = express();
@@ -941,38 +950,8 @@ app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async
         }
         if (bookingId) {
             try {
-                const before = await db.select().from(bookings).where(eq(bookings.id, Number(bookingId))).limit(1);
-                const already = await db.select({ paid: bookings.invoicePaid }).from(bookings).where(eq(bookings.id, Number(bookingId))).limit(1);
-                await db
-                    .update(bookings)
-                    .set(already[0]?.paid ? { invoicePaid: true } : { invoicePaid: true, depositPaidAt: new Date(), depositPaidAmount: amountPaid.toFixed(2) })
-                    .where(eq(bookings.id, Number(bookingId)));
-                console.log(`[stripe] Booking #${bookingId} deposit marked paid via webhook`);
-                broadcastSync('all');
-                const b = before[0];
-                if (b && !b.invoicePaid) {
-                    const ref = String(b.bookingId ?? b.id);
-                    await emailFromTemplate(db, 'client_payment_receipt', { email: b.contactEmail, name: b.contactName }, {
-                        client_name: b.contactName || 'there',
-                        amount: amountPaid.toFixed(2),
-                        reference_label: ref,
-                        payment_for: `${b.serviceType || 'Cleaning'} on ${friendlyDate(b.date)} at ${b.time}`,
-                        paid_at: paidAtLabel,
-                    });
-                    await notifyUsers(db, await listAdminUserIds(db), {
-                        message: `Payment received: £${amountPaid.toFixed(2)} for booking ${ref} (${b.contactName}).`,
-                        pushTitle: 'Payment received',
-                    });
-                    if (b.customerId) {
-                        await notifyUsers(db, [b.customerId], {
-                            type: 'booking_update',
-                            message: `Thank you, we received £${amountPaid.toFixed(2)} for booking ${ref}.`,
-                            pushTitle: 'Payment received',
-                            data: { type: 'booking_update', bookingId: Number(b.id) },
-                        });
-                    }
-                    broadcastSync('notifications');
-                }
+                // Deposit, pay in full, or the balance after the clean.
+                await recordBookingPayment({ db, stripe }, pi);
             } catch (e: any) {
                 console.error('[stripe] Failed to update booking:', e?.message);
             }
@@ -3019,6 +2998,7 @@ app.post('/api/bookings', async (req, res) => {
                 discountAmount: discountAmount.toString(),
                 pointsEarned: pointsToEarn,
                 depositTermsAcceptedAt: new Date(),
+                paymentChoice: normalizeChoice(bookingData.paymentChoice),
                 priceRegion: serverPrice?.region ?? null,
                 hourlyRate: serverPrice ? serverPrice.hourlyRate.toFixed(2) : null,
             })
@@ -3114,18 +3094,16 @@ app.post('/api/bookings', async (req, res) => {
         let stripePaymentLinkForResponse = '';
         if (stripe && bookingTotalGbp > 0) {
             try {
-                const depositPolicy = settingsMapForBookingEmails.depositPolicy
-                    ? JSON.parse(settingsMapForBookingEmails.depositPolicy)
-                    : { requiredPercent: 40 };
-                const depositPercent = Number(depositPolicy.requiredPercent) || 40;
-                const chargeAmount = +(bookingTotalGbp * depositPercent / 100).toFixed(2);
+                const depositPercent = depositPercentOf(settingsMapForBookingEmails);
+                const choice = normalizeChoice(bookingData.paymentChoice);
+                const chargeAmount = firstChargeAmount(bookingTotalGbp, depositPercent, choice);
                 const amountPence = Math.round(chargeAmount * 100);
                 if (amountPence >= 30) {
                     const pi = await stripe.paymentIntents.create({
                         amount: amountPence,
                         currency: 'gbp',
-                        metadata: { bookingId: String(numericBookingId), bookingRef: publicBookingId },
-                        description: `Deposit (${depositPercent}%) — Booking ${publicBookingId} — ${bookingData.contact?.name || 'Guest'}`,
+                        metadata: { bookingId: String(numericBookingId), bookingRef: publicBookingId, kind: choice },
+                        description: `${choice === 'full' ? 'Full payment' : `Deposit (${depositPercent}%)`} — Booking ${publicBookingId} — ${bookingData.contact?.name || 'Guest'}`,
                         receipt_email: contactEmail || undefined,
                     });
                     const payUrl = `${publicBaseUrlFromRequest(req)}/pay/booking/${numericBookingId}`;
@@ -3137,9 +3115,10 @@ app.post('/api/bookings', async (req, res) => {
 
                     const brandVars = await loadBrandVars(db);
                     payNowHtml = `<div style="text-align:center;margin:24px 0;">
-  <p style="margin:0 0 12px;font-size:15px;font-weight:700;color:#0f172a;">Pay your deposit online — quick &amp; secure</p>
-  <a href="${payUrl}" style="display:inline-block;background:${brandVars.brand_primary || '#7c3aed'};color:#ffffff;padding:16px 36px;border-radius:12px;font-weight:800;text-decoration:none;font-size:16px;">Pay Now — £${chargeAmount.toFixed(2)}</a>
-  <p style="font-size:12px;color:#64748b;margin-top:10px;">Or copy this link: ${payUrl}</p>
+  <p style="margin:0 0 12px;font-size:15px;font-weight:700;color:#0f172a;">${choice === 'full' ? 'Pay in full online' : 'Pay your deposit online'}, quick &amp; secure</p>
+  <a href="${payUrl}" style="display:inline-block;background:${brandVars.brand_primary || '#7c3aed'};color:#ffffff;padding:16px 36px;border-radius:12px;font-weight:800;text-decoration:none;font-size:16px;">Pay Now: £${chargeAmount.toFixed(2)}</a>
+  <p style="font-size:12px;color:#64748b;margin-top:10px;">${choice === 'full' ? 'You chose to pay in full, so nothing more is due after your clean.' : `This is your ${depositPercent}% deposit. The balance of £${(bookingTotalGbp - chargeAmount).toFixed(2)} is due after your clean. You can also choose to pay in full on the payment page.`}</p>
+  <p style="font-size:12px;color:#64748b;margin-top:6px;">Or copy this link: ${payUrl}</p>
 </div>`;
                 }
             } catch (stripeErr) {
@@ -3328,6 +3307,7 @@ app.get('/api/bookings/:id', authenticateToken, async (req: any, res) => {
 
 /** Shapes booking rows for portal clients (nested contact/address, merged staff ids; staff never see price or client contact details). */
 async function enrichBookingsForViewer(results: any[], isStaffViewer: boolean) {
+        const depositPct = isStaffViewer ? 40 : depositPercentOf(await loadBusinessSettingsMap(db));
         const resultIds = results.map(b => Number(b.id)).filter(id => Number.isFinite(id) && id > 0);
         const relevantAssignments = resultIds.length > 0
             ? await db.select().from(bookingStaff).where(inArray(bookingStaff.bookingId, resultIds))
@@ -3382,6 +3362,8 @@ async function enrichBookingsForViewer(results: any[], isStaffViewer: boolean) {
                     ? (chatClosedAt instanceof Date ? chatClosedAt.toISOString() : String(chatClosedAt))
                     : null,
                 invoicePaid: Boolean((b as { invoicePaid?: boolean }).invoicePaid),
+                /** Deposit or full choice, paid so far and the balance (clients and admin only). */
+                ...(isStaffViewer ? {} : paymentFieldsForViewer(b, depositPct)),
             };
         });
 }
@@ -4432,7 +4414,7 @@ app.post('/api/bookings/:id/create-payment-intent', authenticateToken, async (re
         const depositPolicy = settingsMap.depositPolicy ? JSON.parse(settingsMap.depositPolicy) : { requiredPercent: 40 };
         const depositPercent = Number(depositPolicy.requiredPercent) || 40;
         const totalPrice = Number(bRow.totalPrice) || 0;
-        const isFullPayment = req.body?.fullPayment === true;
+        const isFullPayment = req.body?.fullPayment === true || normalizeChoice((bRow as any).paymentChoice) === 'full';
         const chargeAmount = isFullPayment ? totalPrice : +(totalPrice * depositPercent / 100).toFixed(2);
         const amountPence = Math.round(chargeAmount * 100);
         if (amountPence < 30) return res.status(400).json({ error: 'Amount too small for Stripe (minimum £0.30)' });
@@ -4441,7 +4423,7 @@ app.post('/api/bookings/:id/create-payment-intent', authenticateToken, async (re
         const pi = await stripe.paymentIntents.create({
             amount: amountPence,
             currency: 'gbp',
-            metadata: { bookingId: String(bRow.id), bookingRef: displayRef },
+            metadata: { bookingId: String(bRow.id), bookingRef: displayRef, kind: isFullPayment ? 'full' : 'deposit' },
             description: `${isFullPayment ? 'Full payment' : `Deposit (${depositPercent}%)`} — Booking ${displayRef} — ${bRow.contactName}`,
             receipt_email: bRow.contactEmail || undefined,
         });
@@ -4459,49 +4441,7 @@ app.post('/api/bookings/:id/create-payment-intent', authenticateToken, async (re
     }
 });
 
-app.get('/api/pay/booking/:id', async (req, res) => {
-    try {
-        const id = parseInt(req.params.id, 10);
-        if (Number.isNaN(id)) return res.status(400).json({ error: 'Invalid id' });
-        const rows = await db.select().from(bookings).where(eq(bookings.id, id)).limit(1);
-        if (!rows.length) return res.status(404).json({ error: 'Booking not found' });
-        const b = rows[0];
-
-        if (b.invoicePaid) return res.json({ paid: true, bookingRef: String(b.bookingId ?? b.id) });
-        if (!(b as any).stripePaymentIntentId || !stripe) return res.status(400).json({ error: 'No payment set up for this booking' });
-
-        const pi = await stripe.paymentIntents.retrieve((b as any).stripePaymentIntentId);
-        if (pi.status === 'succeeded') {
-            await db
-                .update(bookings)
-                .set({ invoicePaid: true, depositPaidAt: new Date(), depositPaidAmount: ((Number(pi.amount_received || pi.amount) || 0) / 100).toFixed(2) })
-                .where(eq(bookings.id, id));
-            return res.json({ paid: true, bookingRef: String(b.bookingId ?? b.id) });
-        }
-
-        const brandVars = await loadBrandVars(db);
-        const settingsMap = await loadBusinessSettingsMap(db);
-        const depositPolicy = settingsMap.depositPolicy ? JSON.parse(settingsMap.depositPolicy) : { requiredPercent: 40 };
-
-        res.json({
-            clientSecret: pi.client_secret,
-            publishableKey: process.env.STRIPE_PUBLISHABLE_KEY || '',
-            bookingRef: String(b.bookingId ?? b.id),
-            customerName: b.contactName,
-            total: Number(b.totalPrice),
-            depositPercent: Number(depositPolicy.requiredPercent) || 40,
-            depositAmount: Number(pi.amount) / 100,
-            serviceType: b.serviceType,
-            date: b.date,
-            time: b.time,
-            brandName: brandVars.brand_name || 'CiN Cleaning',
-            brandPrimary: brandVars.brand_primary || '#7c3aed',
-        });
-    } catch (e: any) {
-        console.error('Get booking payment info error:', e?.message || e);
-        res.status(500).json({ error: 'Failed to load payment info' });
-    }
-});
+registerBookingPaymentRoutes(app, { db, stripe, authenticateToken, publicBaseUrlFromRequest });
 
 app.post('/api/bookings/:id/send-confirmation', authenticateToken, async (req: any, res) => {
     try {
@@ -7466,7 +7406,7 @@ app.get('/pay/booking/:id', async (req, res) => {
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Pay Deposit — ${brandName}</title>
+<title>Secure Payment | ${brandName}</title>
 <script src="https://js.stripe.com/v3/"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -7480,7 +7420,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .info-card{padding:14px;background:#f1f5f9;border-radius:10px}
 .info-card .label{font-size:12px;color:#64748b;font-weight:600;margin-bottom:2px}
 .info-card .value{font-size:16px;font-weight:800;color:#0f172a}
-.info-card.full{grid-column:1/-1}
+.options{display:grid;gap:10px;margin-bottom:20px}
+.opt{display:flex;align-items:center;gap:12px;border:2px solid #e2e8f0;border-radius:12px;padding:14px 16px;cursor:pointer;transition:border-color .15s,background .15s;text-align:left;background:#fff;width:100%;color:#0f172a;font:inherit}
+.opt.on{border-color:${brandPrimary};background:#f8fafc}
+.opt .dot{width:20px;height:20px;border-radius:50%;border:2px solid #cbd5e1;flex-shrink:0;display:flex;align-items:center;justify-content:center}
+.opt.on .dot{border-color:${brandPrimary}}
+.opt.on .dot:after{content:'';width:10px;height:10px;border-radius:50%;background:${brandPrimary}}
+.opt .t{font-size:15px;font-weight:800}
+.opt .s{font-size:12px;color:#64748b;margin-top:2px}
+.opt .amt{margin-left:auto;font-size:17px;font-weight:900;white-space:nowrap}
 .deposit-box{background:#f0fdfa;border:2px solid #99f6e4;border-radius:12px;padding:16px;text-align:center;margin-bottom:20px}
 .deposit-box .amount{font-size:28px;font-weight:900;color:#0f172a}
 .deposit-box .label{font-size:13px;color:#64748b;margin-top:2px}
@@ -7488,9 +7436,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 #card-element.StripeElement--focus{border-color:${brandPrimary}}
 #card-element.StripeElement--invalid{border-color:#ef4444}
 #card-errors{color:#ef4444;font-size:13px;margin-bottom:12px;min-height:20px}
-button{width:100%;padding:16px;background:${brandPrimary};color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;transition:opacity .2s}
-button:hover{opacity:.9}
-button:disabled{opacity:.5;cursor:not-allowed}
+button.pay{width:100%;padding:16px;background:${brandPrimary};color:#fff;border:none;border-radius:10px;font-size:16px;font-weight:700;cursor:pointer;transition:opacity .2s}
+button.pay:hover{opacity:.9}
+button.pay:disabled{opacity:.5;cursor:not-allowed}
 .success{text-align:center;padding:40px 28px}
 .success .check{width:64px;height:64px;background:#10b981;border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 16px}
 .success .check svg{width:32px;height:32px;color:#fff}
@@ -7504,47 +7452,77 @@ button:disabled{opacity:.5;cursor:not-allowed}
 <div class="card">
   <div class="header">
     <h1>${brandName}</h1>
-    <p>Secure Deposit Payment</p>
+    <p id="subtitle">Secure Payment</p>
   </div>
   <div id="app" class="body"><div class="loading">Loading booking details...</div></div>
 </div>
 <script>
 (async()=>{
   const app=document.getElementById('app');
+  const money=n=>'&pound;'+Number(n).toFixed(2);
+  const tick='<div class="check"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"/></svg></div>';
   try{
     const r=await fetch('/api/pay/booking/${id}');
     const d=await r.json();
     if(!r.ok){app.innerHTML='<div class="error-msg">'+(d.error||'Unable to load booking')+'</div>';return}
     if(d.paid){
-      app.innerHTML='<div class="success"><div class="check"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"/></svg></div><h2>Deposit Paid</h2><p>Booking '+d.bookingRef+' deposit has been received. Thank you!</p></div>';
+      app.innerHTML='<div class="success">'+tick+'<h2>Paid in full</h2><p>Booking '+d.bookingRef+' is fully paid ('+money(d.total)+'). Thank you!</p></div>';
       return;
     }
-    app.innerHTML=
-      '<div class="info">'+
+    const info='<div class="info">'+
         '<div class="info-card"><div class="label">Booking Ref</div><div class="value">#'+d.bookingRef+'</div></div>'+
         '<div class="info-card"><div class="label">Service</div><div class="value">'+d.serviceType+'</div></div>'+
         '<div class="info-card"><div class="label">Date</div><div class="value">'+d.date+'</div></div>'+
         '<div class="info-card"><div class="label">Time</div><div class="value">'+d.time+'</div></div>'+
-      '</div>'+
-      '<div class="deposit-box"><div class="amount">&pound;'+d.depositAmount.toFixed(2)+'</div><div class="label">Deposit ('+d.depositPercent+'% of &pound;'+d.total.toFixed(2)+' total)</div></div>'+
-      '<form id="payment-form"><div id="card-element"></div><div id="card-errors" role="alert"></div><button type="submit" id="pay-btn">Pay Deposit &pound;'+d.depositAmount.toFixed(2)+'</button></form>';
+      '</div>';
+    let amount=d.amount, choice=d.choice, secret=d.clientSecret;
+    let summary='';
+    if(d.stage==='balance'){
+      document.getElementById('subtitle').textContent='Balance Payment';
+      summary='<div class="deposit-box"><div class="amount">'+money(d.amount)+'</div><div class="label">Balance due. You have paid '+money(d.amountPaid)+' of '+money(d.total)+'.</div></div>';
+    }else{
+      summary='<div class="options">'+
+        '<button type="button" class="opt" data-choice="deposit"><span class="dot"></span><span><div class="t">Pay '+d.depositPercent+'% deposit</div><div class="s">Balance of '+money(d.total-d.depositAmount)+' is due after your clean</div></span><span class="amt">'+money(d.depositAmount)+'</span></button>'+
+        '<button type="button" class="opt" data-choice="full"><span class="dot"></span><span><div class="t">Pay in full</div><div class="s">Nothing more to pay after your clean</div></span><span class="amt">'+money(d.total)+'</span></button>'+
+      '</div>';
+    }
+    app.innerHTML=info+summary+'<form id="payment-form"><div id="card-element"></div><div id="card-errors" role="alert"></div><button type="submit" class="pay" id="pay-btn"></button></form>';
+    const btn=document.getElementById('pay-btn');
+    const label=()=>{btn.innerHTML=(d.stage==='balance'?'Pay balance ':choice==='full'?'Pay in full ':'Pay deposit ')+money(amount)};
+    const paint=()=>{document.querySelectorAll('.opt').forEach(o=>o.classList.toggle('on',o.dataset.choice===choice));label()};
+    paint();
+    document.querySelectorAll('.opt').forEach(o=>o.addEventListener('click',async()=>{
+      if(o.dataset.choice===choice)return;
+      const prev=choice;choice=o.dataset.choice;paint();btn.disabled=true;
+      try{
+        const rr=await fetch('/api/pay/booking/${id}/option',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({choice})});
+        const dd=await rr.json();
+        if(!rr.ok)throw new Error(dd.error||'Could not change option');
+        amount=dd.amount;if(dd.clientSecret)secret=dd.clientSecret;
+      }catch(e){choice=prev;document.getElementById('card-errors').textContent=e.message}
+      paint();btn.disabled=false;
+    }));
 
     const stripe=Stripe(d.publishableKey);
-    const elements=stripe.elements({clientSecret:d.clientSecret,appearance:{theme:'stripe'}});
+    const elements=stripe.elements({appearance:{theme:'stripe'}});
     const card=elements.create('card',{style:{base:{fontSize:'16px',color:'#0f172a','::placeholder':{color:'#94a3b8'}}}});
     card.mount('#card-element');
     card.on('change',e=>{document.getElementById('card-errors').textContent=e.error?e.error.message:''});
 
     document.getElementById('payment-form').addEventListener('submit',async(ev)=>{
       ev.preventDefault();
-      const btn=document.getElementById('pay-btn');
       btn.disabled=true;btn.textContent='Processing...';
-      const{error,paymentIntent}=await stripe.confirmCardPayment(d.clientSecret,{payment_method:{card}});
+      document.querySelectorAll('.opt').forEach(o=>o.disabled=true);
+      const{error,paymentIntent}=await stripe.confirmCardPayment(secret,{payment_method:{card}});
       if(error){
         document.getElementById('card-errors').textContent=error.message;
-        btn.disabled=false;btn.textContent='Pay Deposit \\u00a3'+d.depositAmount.toFixed(2);
+        btn.disabled=false;label();document.querySelectorAll('.opt').forEach(o=>o.disabled=false);
       }else if(paymentIntent.status==='succeeded'){
-        app.innerHTML='<div class="success"><div class="check"><svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M5 13l4 4L19 7"/></svg></div><h2>Payment Successful</h2><p>Your deposit for booking #'+d.bookingRef+' has been received. You will receive a confirmation shortly.</p></div>';
+        fetch('/api/pay/booking/${id}').catch(()=>{});
+        const msg=d.stage==='balance'?'Your balance for booking #'+d.bookingRef+' has been paid. Thank you!'
+          :choice==='full'?'Booking #'+d.bookingRef+' is paid in full. Nothing more to pay after your clean.'
+          :'Your deposit for booking #'+d.bookingRef+' has been received. The balance is due after your clean.';
+        app.innerHTML='<div class="success">'+tick+'<h2>Payment Successful</h2><p>'+msg+'</p></div>';
       }
     });
   }catch(e){app.innerHTML='<div class="error-msg">Something went wrong. Please try again later.</div>'}
@@ -7739,6 +7717,17 @@ async function startServer() {
         }
     };
     setInterval(() => void runTrackingMonitor(''), 5 * 60 * 1000);
+    // Balance requests go out within a few minutes of a job being marked done.
+    const runBalance = async (label: string) => {
+        try {
+            const r = await runBalanceRequests(db);
+            if (r.sent > 0) console.log(`[balance requests]${label}`, r);
+        } catch (err) {
+            console.error(`[balance requests]${label}`, err);
+        }
+    };
+    setInterval(() => void runBalance(''), 5 * 60 * 1000);
+    setTimeout(() => void runBalance(' startup'), 90_000);
     startWeeklyReportSchedule(db, { absoluteSiteUrl, notifyAdmins: notifyAdminsAboutReport });
     setTimeout(() => void runTrackingMonitor(' startup'), 60_000);
 
