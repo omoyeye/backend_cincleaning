@@ -1,5 +1,21 @@
 import * as Brevo from '@getbrevo/brevo';
 import { getBrevoConfig } from './brevoConfig';
+import { db } from '../db';
+import { EMAIL_SHELL_MARKER, wrapHtmlInEmailShell } from '../messageTemplates/engine';
+
+/**
+ * Every email carries the branded layout (logo, contact details, footer). Templates are already wrapped;
+ * hand-written HTML (GDPR notices, admin alerts, tests) is wrapped here. Full HTML documents are left alone.
+ */
+async function withBrandedLayout(html: string): Promise<string> {
+    if (!html || html.includes(EMAIL_SHELL_MARKER) || /<html[\s>]/i.test(html)) return html;
+    try {
+        return await wrapHtmlInEmailShell(db, html, {});
+    } catch (e) {
+        console.error('[email] could not apply branded layout:', e instanceof Error ? e.message : e);
+        return html;
+    }
+}
 
 interface SendEmailParams {
     to: { email: string; name?: string }[];
@@ -23,7 +39,7 @@ export const sendEmail = async ({ to, subject, htmlContent }: SendEmailParams) =
     const api = buildApiInstance(cfg.apiKey);
     const sendSmtpEmail = new Brevo.SendSmtpEmail();
     sendSmtpEmail.subject = subject;
-    sendSmtpEmail.htmlContent = htmlContent;
+    sendSmtpEmail.htmlContent = await withBrandedLayout(htmlContent);
     const senderName = cfg.senderName?.trim() || 'CiN Cleaning';
     const senderEmail = cfg.senderEmail?.trim() || 'no-reply@niceandneat.com';
     sendSmtpEmail.sender = { name: senderName, email: senderEmail };

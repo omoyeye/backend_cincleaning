@@ -21,23 +21,74 @@ export const DEFAULT_EMAIL_TEMPLATES: EmailTemplateSeed[] = [
     subject: '-',
     description:
       'Outer layout for all transactional emails. Edit colors, header, and footer. Keep {{inner_content}} where the specific email body should appear. {{brand_logo_block}} and {{contact_block}} are filled from business settings + SITE_URL.',
-    variables: ['inner_content', 'brand_name', 'brand_primary', 'footer_note', 'brand_logo_block', 'contact_block'],
-    body: `<div style="background:#f1f5f9;padding:28px 16px;font-family:system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#334155;">
-  <div style="max-width:560px;margin:0 auto;background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 8px 30px rgba(15,23,42,0.08);">
-    {{brand_logo_block}}
-    <div style="background:{{brand_primary}};color:#ffffff;padding:22px 24px;font-size:20px;font-weight:800;letter-spacing:-0.02em;">{{brand_name}}</div>
-    <div style="padding:28px 24px;line-height:1.65;font-size:15px;">{{inner_content}}</div>
-    {{contact_block}}
-    <div style="padding:18px 24px;background:#f8fafc;border-top:1px solid #e2e8f0;font-size:12px;color:#64748b;line-height:1.5;">
-      {{footer_note}}
-      <p style="margin:12px 0 0;font-size:11px;color:#94a3b8;">
-        You are receiving this email because you have an account with {{brand_name}} or made a booking with us.
-        To manage your email preferences or exercise your data rights under UK GDPR, please log in to your account or contact us.
-        {{brand_name}} is a trading name of Surpluslink &amp; Co LTD, registered in England &amp; Wales.
-      </p>
-    </div>
-  </div>
-</div>`,
+    variables: ['inner_content', 'preheader', 'brand_name', 'brand_primary', 'brand_tagline', 'footer_note', 'brand_logo_block', 'contact_block', 'social_block', 'brand_phone', 'brand_phone_href', 'brand_website_url', 'year'],
+    body: `<!--cin-shell-v2-->
+<div style="display:none;font-size:1px;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;mso-hide:all;">{{preheader}}&#8203;&#8204;&#8203;&#8204;&#8203;&#8204;&#8203;&#8204;&#8203;&#8204;</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#eef2f7;margin:0;padding:0;">
+  <tr>
+    <td align="center" style="padding:32px 12px 24px;">
+      <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:600px;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+
+        <!-- Header: accent bar, logo, tagline -->
+        <tr>
+          <td style="background:#ffffff;border-radius:20px 20px 0 0;border-top:6px solid {{brand_primary}};padding:30px 32px 18px;text-align:center;">
+            {{brand_logo_block}}
+            <p style="margin:12px 0 0;font-size:11px;font-weight:700;letter-spacing:1.5px;line-height:1.6;text-transform:uppercase;color:#94a3b8;">{{brand_tagline}}</p>
+          </td>
+        </tr>
+        <tr>
+          <td style="background:#ffffff;padding:0 32px;">
+            <div style="height:1px;line-height:1px;background:#e2e8f0;">&nbsp;</div>
+          </td>
+        </tr>
+
+        <!-- Message -->
+        <tr>
+          <td style="background:#ffffff;padding:30px 32px 8px;font-size:15px;line-height:1.7;color:#334155;word-break:break-word;overflow-wrap:anywhere;">
+            {{inner_content}}
+          </td>
+        </tr>
+
+        <!-- Help strip -->
+        <tr>
+          <td style="background:#ffffff;padding:20px 32px 34px;">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:14px;">
+              <tr>
+                <td style="padding:18px 20px;font-size:14px;line-height:1.6;color:#475569;">
+                  <strong style="color:#0f172a;">Questions about your booking?</strong><br />
+                  Reply to this email or call us on <a href="tel:{{brand_phone_href}}" style="color:{{brand_primary}};font-weight:700;text-decoration:none;white-space:nowrap;">{{brand_phone}}</a>. We are happy to help.
+                  <div style="margin-top:12px;">
+                    <a href="tel:{{brand_phone_href}}" style="display:inline-block;margin:4px 6px 0 0;background:{{brand_primary}};color:#ffffff;font-size:13px;font-weight:700;text-decoration:none;padding:10px 16px;border-radius:10px;">Call us</a>
+                    <a href="{{brand_website_url}}" style="display:inline-block;margin:4px 0 0;background:#ffffff;border:1px solid #cbd5e1;color:#0f172a;font-size:13px;font-weight:700;text-decoration:none;padding:9px 16px;border-radius:10px;">Visit website</a>
+                  </div>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+
+        <!-- Footer -->
+        <tr>
+          <td style="background:#0f172a;border-radius:0 0 20px 20px;padding:30px 32px 28px;text-align:center;">
+            <p style="margin:0 0 4px;font-size:17px;font-weight:800;color:#ffffff;letter-spacing:-0.2px;">{{brand_name}}</p>
+            <p style="margin:0 0 14px;font-size:12px;color:#94a3b8;">{{footer_note}}</p>
+            {{contact_block}}
+            {{social_block}}
+            <div style="height:1px;line-height:1px;background:#1e293b;margin:18px 0 14px;">&nbsp;</div>
+            <p style="margin:0;font-size:11px;line-height:1.6;color:#64748b;">
+              You are receiving this email because you have an account with {{brand_name}} or made a booking with us.
+              To manage your email preferences or exercise your data rights under UK GDPR, log in to your account or contact us.
+              {{brand_name}} is a trading name of Surpluslink &amp; Co LTD, registered in England &amp; Wales.
+            </p>
+          </td>
+        </tr>
+        <tr>
+          <td style="padding:18px 12px 0;text-align:center;font-size:11px;color:#94a3b8;">&copy; {{year}} {{brand_name}}. All rights reserved.</td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+</table>`,
   },
   {
     name: 'customer_welcome',

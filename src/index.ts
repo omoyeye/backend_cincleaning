@@ -42,7 +42,7 @@ import {
     loadBrevoConfigFromDb,
     persistBrevoConfig,
 } from './services/brevoConfig';
-import { renderTransactionalEmail, wrapHtmlInEmailShell } from './messageTemplates/engine';
+import { renderTransactionalEmail, renderWithShellBody, wrapHtmlInEmailShell, getEmailTemplateByName } from './messageTemplates/engine';
 import { SERVICE_AREAS } from './shared/routePaths';
 import {
     ensureMessageTemplatesSeededOnce
@@ -6585,6 +6585,46 @@ app.put('/api/email-templates/:id', authenticateToken, async (req: any, res) => 
         res.json({ message: 'Template updated' });
     } catch (error) {
         res.status(500).json({ error: 'Failed to update template' });
+    }
+});
+
+/** Sample values so the admin preview reads like a real email. Unknown variables show as [name]. */
+const EMAIL_PREVIEW_SAMPLES: Record<string, string> = {
+    client_name: 'Jane Smith', name: 'Jane Smith', staff_name: 'Alex Johnson', first_name: 'Jane',
+    client_email: 'jane@example.com', client_phone: '07700 900123', email: 'jane@example.com',
+    booking_id: 'CIN-12345', reference_label: 'CIN-12345', invoice_number: 'INV-1001',
+    service_type: 'Deep Cleaning', service_date: 'Mon 20 Oct', service_time: '10:00',
+    job_address: '1 Hackney Road, London, E2 7NX', postcode: 'E2 7NX',
+    amount: '54.00', total: '54.00', amount_paid: '21.60', balance: '32.40',
+    payment_for: 'Deposit: Deep Cleaning on Mon 20 Oct at 10:00', paid_at: '18 Oct 2026, 11:05',
+    referral_code: 'JANE2026', password: '••••••••',
+    booking_details_html: '<p style="padding:14px 16px;background:#f8fafc;border-radius:10px;border:1px solid #e2e8f0;"><strong>Deep Cleaning</strong><br/>Mon 20 Oct at 10:00 · 4 hours<br/>1 Hackney Road, London, E2 7NX<br/><strong>Total: £54.00</strong></p>',
+};
+
+app.post('/api/admin/email-templates/preview', authenticateToken, async (req: any, res) => {
+    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+    try {
+        const name = String(req.body?.name || '');
+        const body = String(req.body?.body || '');
+        const subject = String(req.body?.subject || '');
+        const brand = await loadBrandVars(db);
+        const site = brand.brand_website_url || 'https://www.cleanitneatly.com';
+        const vars: Record<string, string> = { ...EMAIL_PREVIEW_SAMPLES, pay_url: `${site}/pay/booking/1`, portal_url: `${site}/my-account`, ...brand };
+        const fill = (str: string) =>
+            str.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_m, k: string) => (vars[k] != null ? String(vars[k]) : `[${k}]`));
+        let html: string;
+        if (name === 'email_shell') {
+            const sample = `<p>Hi ${vars.client_name},</p><p>This is how your messages look inside the layout. Each email's own text appears here.</p>`;
+            html = await renderWithShellBody(db, body, sample, vars);
+        } else {
+            const shell = await getEmailTemplateByName(db, 'email_shell');
+            const inner = fill(body);
+            html = shell?.active ? await renderWithShellBody(db, shell.body, inner, vars) : inner;
+        }
+        res.json({ subject: fill(subject), html });
+    } catch (error) {
+        console.error('Email preview failed:', error);
+        res.status(500).json({ error: 'Could not build the preview' });
     }
 });
 

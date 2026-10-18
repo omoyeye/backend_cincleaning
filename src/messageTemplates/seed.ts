@@ -71,9 +71,8 @@ export async function ensureMessageTemplatesSeeded(db: any): Promise<void> {
   if (shellRow) {
     const existing = await db.select().from(emailTemplates).where(eq(emailTemplates.name, 'email_shell')).limit(1);
     const body = String(existing[0]?.body || '');
-    const needsLogo = !body.includes('brand_logo_block');
-    const needsContact = !body.includes('contact_block');
-    if (existing.length && (needsLogo || needsContact)) {
+    // v2 is the branded layout (logo header, help strip, dark footer with contact details and socials).
+    if (existing.length && !body.includes('cin-shell-v2')) {
       await db
         .update(emailTemplates)
         .set({
