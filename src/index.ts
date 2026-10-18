@@ -112,6 +112,15 @@ import rateLimit from 'express-rate-limit';
 const app = express();
 const envJwtSecret = String(process.env.JWT_SECRET || '');
 const isProd = process.env.NODE_ENV === 'production';
+
+/**
+ * Behind LiteSpeed/Apache on DirectAdmin every request reaches Node from the proxy, so without this
+ * all visitors share one IP and one login rate limit. On in production; TRUST_PROXY=0 turns it off.
+ */
+const trustProxy = String(process.env.TRUST_PROXY ?? (isProd ? '1' : '')).trim().toLowerCase();
+if (trustProxy && trustProxy !== '0' && trustProxy !== 'false') {
+    app.set('trust proxy', /^\d+$/.test(trustProxy) ? Number(trustProxy) : trustProxy === 'true' ? 1 : trustProxy);
+}
 const JWT_SECRET =
     envJwtSecret && envJwtSecret.length >= 32
         ? envJwtSecret
@@ -842,10 +851,21 @@ function resolveCorsOrigins(): string[] {
     }
 }
 const corsOrigins = resolveCorsOrigins();
+/** Entries may use "*" as a wildcard, e.g. https://cincleaning-*.vercel.app for Vercel preview deployments. */
+const corsPatterns = corsOrigins.map((o) =>
+    o.includes('*') ? new RegExp(`^${o.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[a-z0-9-]+')}$`, 'i') : null
+);
+function isAllowedOrigin(origin: string | undefined): boolean {
+    if (!origin) return true; // same-origin requests, server-to-server calls and the mobile app send no Origin
+    const clean = origin.replace(/\/$/, '');
+    return corsOrigins.some((o, i) => (corsPatterns[i] ? corsPatterns[i]!.test(clean) : o === clean));
+}
 const corsOptions = {
     credentials: true,
     // Development (no origins configured) reflects any origin; production should set PUBLIC_SITE_URL or CORS_ORIGIN.
-    origin: corsOrigins.length ? corsOrigins : (true as boolean),
+    origin: corsOrigins.length
+        ? (origin: string | undefined, cb: (err: Error | null, allow?: boolean) => void) => cb(null, isAllowedOrigin(origin))
+        : (true as boolean),
     exposedHeaders: ['X-Total-Count', 'X-Page', 'X-Limit'],
 };
 app.use(cors(corsOptions));
