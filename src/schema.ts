@@ -106,6 +106,10 @@ export const bookings = mysqlTable('bookings', {
     /** Client rating after job completion (1–5); null until submitted */
     rating: int('rating'),
     feedback: text('feedback'),
+    /** Client agreed their rating and comment may be shown on the public website. */
+    reviewPublic: boolean('review_public').default(false),
+    /** Admin hid this review from the public website. */
+    reviewHidden: boolean('review_hidden').default(false),
 
     chatHistory: json('chat_history'),
     chatClosedByAdmin: boolean('chat_closed_by_admin').default(false),

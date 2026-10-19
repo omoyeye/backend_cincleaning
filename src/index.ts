@@ -3388,6 +3388,88 @@ async function enrichBookingsForViewer(results: any[], isStaffViewer: boolean) {
         });
 }
 
+// ─── Public reviews (website) ───────────────────────────────────────────────
+/** "Sarah Jones" -> "Sarah J." so a published review never shows a full name. */
+function publicReviewerName(fullName: string): string {
+    const parts = String(fullName || '').trim().split(/\s+/).filter(Boolean);
+    if (!parts.length) return 'A customer';
+    const first = parts[0].charAt(0).toUpperCase() + parts[0].slice(1).toLowerCase();
+    return parts.length > 1 ? `${first} ${parts[parts.length - 1].charAt(0).toUpperCase()}.` : first;
+}
+
+let publicReviewsCache: { at: number; body: unknown } | null = null;
+
+/**
+ * Real ratings for the website: the average and count include every rated booking; the list only
+ * shows reviews the client agreed to publish, with a comment, that an admin has not hidden.
+ */
+app.get('/api/public/reviews', async (_req, res) => {
+    try {
+        if (publicReviewsCache && Date.now() - publicReviewsCache.at < 5 * 60 * 1000) {
+            res.setHeader('Cache-Control', 'public, max-age=300');
+            return res.json(publicReviewsCache.body);
+        }
+        const rated = await db
+            .select({ rating: bookings.rating })
+            .from(bookings)
+            .where(sql`${bookings.rating} IS NOT NULL`);
+        const ratings = rated.map((r) => Number(r.rating)).filter((n) => n >= 1 && n <= 5);
+        const distribution: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+        ratings.forEach((n) => { distribution[n]++; });
+        const rows = await db
+            .select({
+                id: bookings.id,
+                contactName: bookings.contactName,
+                serviceType: bookings.serviceType,
+                addressCity: bookings.addressCity,
+                date: bookings.date,
+                rating: bookings.rating,
+                feedback: bookings.feedback,
+            })
+            .from(bookings)
+            .where(and(
+                sql`${bookings.rating} IS NOT NULL`,
+                eq(bookings.reviewPublic, true),
+                sql`(${bookings.reviewHidden} IS NULL OR ${bookings.reviewHidden} = FALSE)`,
+                sql`${bookings.feedback} IS NOT NULL AND TRIM(${bookings.feedback}) <> ''`,
+            ))
+            .orderBy(desc(bookings.date))
+            .limit(12);
+        const body = {
+            averageRating: ratings.length ? +(ratings.reduce((s, n) => s + n, 0) / ratings.length).toFixed(1) : null,
+            reviewCount: ratings.length,
+            distribution,
+            reviews: rows.map((r) => ({
+                id: r.id,
+                name: publicReviewerName(r.contactName),
+                area: r.addressCity || null,
+                service: r.serviceType || null,
+                date: r.date ? String(r.date).slice(0, 10) : null,
+                rating: Number(r.rating),
+                comment: String(r.feedback || '').trim().slice(0, 600),
+            })),
+        };
+        publicReviewsCache = { at: Date.now(), body };
+        res.setHeader('Cache-Control', 'public, max-age=300');
+        res.json(body);
+    } catch (error) {
+        console.error('Public reviews error:', error);
+        res.status(500).json({ error: 'Failed to load reviews' });
+    }
+});
+
+/** Admin: hide or show a review on the public website. */
+app.patch('/api/admin/reviews/:id', authenticateToken, async (req: any, res) => {
+    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+    const id = Number(req.params.id);
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'Invalid review' });
+    const hidden = req.body?.hidden === true;
+    await db.update(bookings).set({ reviewHidden: hidden }).where(eq(bookings.id, id));
+    publicReviewsCache = null;
+    broadcastSync('all');
+    res.json({ id, reviewHidden: hidden });
+});
+
 // ─── Reviews endpoint ───────────────────────────────────────────────────────
 app.get('/api/reviews', authenticateToken, async (req: any, res) => {
     try {
@@ -3465,6 +3547,8 @@ app.get('/api/reviews', authenticateToken, async (req: any, res) => {
                 date: bookings.date,
                 rating: bookings.rating,
                 feedback: bookings.feedback,
+                reviewPublic: bookings.reviewPublic,
+                reviewHidden: bookings.reviewHidden,
                 status: bookings.status,
                 assignedStaffId: bookings.assignedStaffId,
             })
@@ -3505,6 +3589,8 @@ app.get('/api/reviews', authenticateToken, async (req: any, res) => {
                 date: b.date,
                 rating: b.rating,
                 feedback: b.feedback || null,
+                reviewPublic: Boolean(b.reviewPublic),
+                reviewHidden: Boolean(b.reviewHidden),
                 staffNames,
             };
         });
@@ -3672,7 +3758,7 @@ app.patch('/api/bookings/:id', authenticateToken, async (req: any, res) => {
                 return res.json({ message: 'Deposit terms recorded', depositTermsAcceptedAt: now.toISOString() });
             }
 
-            const ratingOnly = keys.length > 0 && keys.every((k) => k === 'rating' || k === 'feedback');
+            const ratingOnly = keys.length > 0 && keys.every((k) => k === 'rating' || k === 'feedback' || k === 'reviewPublic');
 
             if (ratingOnly) {
                 if (!keys.includes('rating')) {
@@ -3695,9 +3781,11 @@ app.patch('/api/bookings/:id', authenticateToken, async (req: any, res) => {
                         ? String(fbRaw).trim().slice(0, 4000)
                         : null;
 
+                const reviewPublic = (bookingUpdates as { reviewPublic?: unknown }).reviewPublic === true;
+                publicReviewsCache = null;
                 await db
                     .update(bookings)
-                    .set({ rating: Math.round(r), feedback: fb })
+                    .set({ rating: Math.round(r), feedback: fb, reviewPublic })
                     .where(eq(bookings.id, id));
 
                 const targets = new Set<number>();
@@ -4726,6 +4814,25 @@ app.get('/api/staff', authenticateToken, async (req: any, res) => {
         }));
     }
     if (req.user.role === 'customer') {
+        // Real average rating per cleaner from rated jobs they worked on (none yet = null).
+        const ratedJobs = await db
+            .select({ bookingId: bookings.id, legacyStaffId: bookings.assignedStaffId, rating: bookings.rating })
+            .from(bookings)
+            .where(sql`${bookings.rating} IS NOT NULL`);
+        const ratedIds = ratedJobs.map((j) => j.bookingId);
+        const links = ratedIds.length
+            ? await db.select({ bookingId: bookingStaff.bookingId, staffId: bookingStaff.staffId }).from(bookingStaff).where(inArray(bookingStaff.bookingId, ratedIds))
+            : [];
+        const perStaff = new Map<number, number[]>();
+        for (const j of ratedJobs) {
+            const ids = new Set<number>(links.filter((l) => l.bookingId === j.bookingId && l.staffId != null).map((l) => Number(l.staffId)));
+            if (j.legacyStaffId != null) ids.add(Number(j.legacyStaffId));
+            ids.forEach((sid) => perStaff.set(sid, [...(perStaff.get(sid) || []), Number(j.rating)]));
+        }
+        const staffRating = (sid: number) => {
+            const list = perStaff.get(sid);
+            return list && list.length ? +(list.reduce((a, b) => a + b, 0) / list.length).toFixed(1) : null;
+        };
         // Expose only assignment-safe public staff fields to client portal.
         return res.json(results.map((s) => ({
             id: s.id,
@@ -4734,7 +4841,8 @@ app.get('/api/staff', authenticateToken, async (req: any, res) => {
             status: s.status,
             imageUrl: s.imageUrl,
             profilePhoto: s.imageUrl,
-            rating: 4.9,
+            rating: staffRating(Number(s.id)),
+            ratingCount: perStaff.get(Number(s.id))?.length ?? 0,
             isVerified: s.status === 'Active',
             email: '',
             hourlyRate: Number(s.hourlyRate || 0),

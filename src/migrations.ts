@@ -14,6 +14,9 @@ const COLUMN_MIGRATIONS = [
     'ALTER TABLE `bookings` ADD COLUMN `balance_paid_amount` DECIMAL(10,2) NULL',
     'ALTER TABLE `bookings` ADD COLUMN `stripe_balance_intent_id` VARCHAR(255) NULL',
     'ALTER TABLE `bookings` ADD COLUMN `balance_request_sent_at` TIMESTAMP NULL DEFAULT NULL',
+    // Public reviews: client consent to publish, and admin moderation.
+    'ALTER TABLE `bookings` ADD COLUMN `review_public` BOOLEAN DEFAULT FALSE',
+    'ALTER TABLE `bookings` ADD COLUMN `review_hidden` BOOLEAN DEFAULT FALSE',
     // quote_offers columns added after the first version of the table.
     'ALTER TABLE `quote_offers` ADD COLUMN `client_phone` VARCHAR(50) NULL',
     'ALTER TABLE `quote_offers` ADD COLUMN `client_address` TEXT NULL',
