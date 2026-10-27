@@ -81,6 +81,8 @@ import {
 } from './notify';
 import { runColumnMigrations } from './migrations';
 import { registerStaffAssessmentRoutes } from './staffAssessments';
+import { registerBroadcastRoutes } from './broadcasts';
+import { registerStaffHolidayRoutes, holidayInvoiceLines, markHolidaysClaimed, syncHolidayPayForInvoice, MAX_HOLIDAY_DAYS } from './staffHolidays';
 import { registerStaffPerformanceRoutes } from './staffPerformance';
 import { registerQuoteOfferRoutes } from './quoteOffers';
 import { registerBusinessReportRoutes, startWeeklyReportSchedule } from './businessReports';
@@ -91,7 +93,7 @@ import {
     type HourlyPriceBreakdown,
     type PricingRegion,
 } from './shared/pricing';
-import { getServiceTrigger } from './shared/bookingHelpers';
+import { getServiceTrigger, formatHoursMinutes } from './shared/bookingHelpers';
 import { eq, desc, asc, sql, inArray, or, and, gte, lte } from 'drizzle-orm';
 import type { RowDataPacket } from 'mysql2';
 import bcrypt from 'bcryptjs';
@@ -998,7 +1000,7 @@ function stripHtmlTags(value: unknown): unknown {
 }
 
 app.use((req, _res, next) => {
-    if (req.body && typeof req.body === 'object' && req.path !== '/api/stripe-webhook' && req.path !== '/api/admin/broadcast/email') {
+    if (req.body && typeof req.body === 'object' && req.path !== '/api/stripe-webhook' && req.path !== '/api/admin/broadcast/email' && req.path !== '/api/admin/broadcast/preview') {
         req.body = stripHtmlTags(req.body);
     }
     next();
@@ -1335,6 +1337,8 @@ const requireAdmin = (req: any, res: any): boolean => {
 
 registerJobTrackingRoutes(app, db, authenticateToken, requireAdmin);
 registerStaffAssessmentRoutes(app, db, authenticateToken);
+registerStaffHolidayRoutes(app, db, authenticateToken);
+registerBroadcastRoutes(app, db, authenticateToken, requireAdmin);
 registerStaffPerformanceRoutes(app, db, authenticateToken);
 registerQuoteOfferRoutes(app, db, { authenticateToken, requireAdmin, broadcastSync, absoluteSiteUrl });
 const notifyAdminsAboutReport = async (message: string) => {
@@ -1853,6 +1857,7 @@ app.patch('/api/admin/accounts/:id/menu-scope', authenticateToken, async (req: a
             'liveMap',
             'staff',
             'staffInvoices',
+            'holidays',
             'performance',
             'customerInvoices',
             'expenses',
@@ -2873,7 +2878,7 @@ app.post('/api/bookings', async (req, res) => {
             if (!Number.isFinite(clientTotal) || Math.round(clientTotal * 100) !== serverPrice.breakdown.pence.total) {
                 console.warn(
                     `[pricing] Standard booking total corrected from ${bookingData.totalPrice} to ${correctTotal} ` +
-                    `(${serverPrice.region} via ${serverPrice.regionSource}, £${serverPrice.hourlyRate.toFixed(2)}/h x ${serverPrice.breakdown.hours}h)`,
+                    `(${serverPrice.region} via ${serverPrice.regionSource}, £${serverPrice.hourlyRate.toFixed(2)}/h x ${formatHoursMinutes(Number(serverPrice.breakdown.hours))})`,
                 );
             }
             bookingData.totalPrice = correctTotal;
@@ -2979,7 +2984,7 @@ app.post('/api/bookings', async (req, res) => {
                         conflictCount: conflicts.length,
                         conflictingBookingIds: conflicts.slice(0, 20),
                         message:
-                            'Thanks - your booking is confirmed. We noticed a possible schedule overlap and our team will review it shortly.',
+                            'Your booking has been submitted and is pending confirmation. The time you chose may overlap with another booking, so our team will check it and confirm with you shortly.',
                     };
                 }
             }
@@ -3075,7 +3080,7 @@ app.post('/api/bookings', async (req, res) => {
                         await db.insert(notifications).values({
                             userId: staffRecord[0].userId,
                             type: 'system',
-                            message: `New assignment: Booking ${publicBookingId} for ${bookingData.contact?.name || 'Client'} on ${bookingData.date} at ${bookingData.time} (${bookingData.duration || bookingData.propertyDetails?.duration || 'N/A'}h).`,
+                            message: `New assignment: Booking ${publicBookingId} for ${bookingData.contact?.name || 'Client'} on ${bookingData.date} at ${bookingData.time} (${Number(bookingData.duration || bookingData.propertyDetails?.duration) > 0 ? formatHoursMinutes(Number(bookingData.duration || bookingData.propertyDetails?.duration)) : 'duration to be confirmed'}).`,
                             isRead: false
                         });
                     }
@@ -3996,7 +4001,7 @@ app.patch('/api/bookings/:id', authenticateToken, async (req: any, res) => {
                         await db.insert(notifications).values({
                             userId: staffRecord[0].userId,
                             type: 'system',
-                            message: `New assignment: Booking ${displayBookingLabel} for ${booking.contactName || 'Client'} on ${jobDate} at ${jobTime} (${(booking.propertyDetails as any)?.duration || 'N/A'}h).`,
+                            message: `New assignment: Booking ${displayBookingLabel} for ${booking.contactName || 'Client'} on ${jobDate} at ${jobTime} (${Number((booking.propertyDetails as any)?.duration) > 0 ? formatHoursMinutes(Number((booking.propertyDetails as any)?.duration)) : 'duration to be confirmed'}).`,
                             isRead: false
                         });
                     }
@@ -5082,7 +5087,29 @@ app.put('/api/staff/:id', authenticateToken, async (req: any, res) => {
             'bankName',
             'accountNumber',
             'sortCode',
+            'contractType',
+            'holidayAllowanceDays',
+            'holidayHoursPerDay',
         ] as const;
+        if (req.user.role === 'admin') {
+            if (details.contractType !== undefined) {
+                details.contractType = String(details.contractType) === 'contracted' ? 'contracted' : 'self_employed';
+            }
+            if (details.holidayAllowanceDays !== undefined) {
+                const n = Number(details.holidayAllowanceDays);
+                if (!Number.isFinite(n) || n < 0 || n > MAX_HOLIDAY_DAYS) {
+                    return res.status(400).json({ error: `Holiday allowance must be between 0 and ${MAX_HOLIDAY_DAYS} days.` });
+                }
+                details.holidayAllowanceDays = (Math.round(n * 2) / 2).toFixed(1);
+            }
+            if (details.holidayHoursPerDay !== undefined) {
+                const n = Number(details.holidayHoursPerDay);
+                if (!Number.isFinite(n) || n <= 0 || n > 12) {
+                    return res.status(400).json({ error: 'Paid hours per holiday day must be between 0 and 12.' });
+                }
+                details.holidayHoursPerDay = n.toFixed(2);
+            }
+        }
         const STAFF_SELF_KEYS = [
             'phone',
             'address',
@@ -5241,9 +5268,19 @@ app.post('/api/staff/:id/invoice', authenticateToken, async (req: any, res) => {
             return res.status(403).json({ error: 'Unauthorized' });
         }
 
-        const { totalAmount, jobs, week, bankDetails, weekTotalHours, weekJobCount } = req.body; // Passed from frontend for simplicity or recalc
+        const { totalAmount, jobs, week, bankDetails, weekTotalHours, weekJobCount, holidayIds } = req.body; // Passed from frontend for simplicity or recalc
 
-        const jobList = Array.isArray(jobs) ? jobs : [];
+        let holiday: Awaited<ReturnType<typeof holidayInvoiceLines>>;
+        try {
+            holiday = await holidayInvoiceLines(db, staffId, holidayIds);
+        } catch (e: any) {
+            return res.status(400).json({ error: e?.message || 'Holiday pay could not be added.' });
+        }
+        const workJobs = (Array.isArray(jobs) ? jobs : []).filter((j: any) => j?.kind !== 'holiday');
+        if (!workJobs.length && !holiday.lines.length) {
+            return res.status(400).json({ error: 'Add at least one completed job or holiday pay to the invoice.' });
+        }
+        const jobList = [...workJobs, ...holiday.lines];
 
         const jobListForEmail = await Promise.all(
             jobList.map(async (j: any) => {
@@ -5257,10 +5294,12 @@ app.post('/api/staff/:id/invoice', authenticateToken, async (req: any, res) => {
             })
         );
 
-        const hoursSum = typeof weekTotalHours === 'number'
+        const holidayHours = holiday.lines.reduce((s: number, l: any) => s + (Number(l.yourHours) || 0), 0);
+        const hoursSum = (typeof weekTotalHours === 'number'
             ? weekTotalHours
-            : jobListForEmail.reduce((s: number, j: any) => s + (Number(j.yourHours ?? j.hours) || 0), 0);
-        const jobCount = typeof weekJobCount === 'number' ? weekJobCount : jobListForEmail.length;
+            : workJobs.reduce((s: number, j: any) => s + (Number(j.yourHours ?? j.hours) || 0), 0)) + holidayHours;
+        const jobCount = typeof weekJobCount === 'number' ? weekJobCount : workJobs.length;
+        const invoiceTotal = Number(totalAmount || 0) + holiday.total;
 
         const weekStr = String(week || '');
         const weekParts = weekStr.split(/\s*(?:→|->)\s*|\s+-\s+/);
@@ -5270,19 +5309,22 @@ app.post('/api/staff/:id/invoice', authenticateToken, async (req: any, res) => {
         const [staffRow] = await db.select().from(staff).where(eq(staff.id, staffId)).limit(1);
         const staffName = staffRow?.name ?? `Staff #${staffId}`;
 
-        await db.insert(staffInvoices).values({
+        const [createdInvoice] = await db.insert(staffInvoices).values({
             staffId,
             staffName,
             weekLabel: weekStr || 'Current week',
             weekStart,
             weekEnd,
-            totalAmount: Number(totalAmount || 0).toFixed(2),
+            totalAmount: invoiceTotal.toFixed(2),
             weekTotalHours: Number(hoursSum || 0).toFixed(2),
             weekJobCount: jobCount,
             jobsJson: jobListForEmail,
             bankJson: bankDetails ?? null,
             status: 'Pending',
-        });
+        }).$returningId();
+        if (holiday.ids.length && createdInvoice?.id) {
+            await markHolidaysClaimed(db, Number(createdInvoice.id), holiday.amounts || {});
+        }
 
         // Save first: a failed email must never lose the invoice.
         try {
@@ -5295,7 +5337,7 @@ app.post('/api/staff/:id/invoice', authenticateToken, async (req: any, res) => {
                 staff_name: staffName,
                 staff_id: String(staffId),
                 week: String(week || ''),
-                total_amount: Number(totalAmount || 0).toFixed(2),
+                total_amount: invoiceTotal.toFixed(2),
                 hours_sum: Number(hoursSum || 0).toFixed(2),
                 job_count: String(jobCount),
                 bank_name: bankDetails?.bankName || 'Not provided',
@@ -5425,6 +5467,7 @@ app.patch('/api/invoices/:id', authenticateToken, async (req: any, res) => {
         if (status !== undefined) patch.status = String(status);
         if (adminNotes !== undefined) patch.adminNotes = cleanInvoiceNote(adminNotes);
         await db.update(staffInvoices).set(patch).where(eq(staffInvoices.id, id));
+        if (patch.status) await syncHolidayPayForInvoice(db, id, patch.status as 'Pending' | 'Approved' | 'Rejected');
 
         const staffIdForInvoice = Number(existing[0].staffId);
         const staffRow = await db.select().from(staff).where(eq(staff.id, staffIdForInvoice)).limit(1);
@@ -5467,6 +5510,7 @@ app.delete('/api/invoices/:id', authenticateToken, async (req: any, res) => {
         const existing = await db.select().from(staffInvoices).where(eq(staffInvoices.id, id)).limit(1);
         if (!existing.length) return res.status(404).json({ error: 'Invoice not found' });
         await db.delete(staffInvoices).where(eq(staffInvoices.id, id));
+        await syncHolidayPayForInvoice(db, id, 'Deleted');
 
         // Let the cleaner know, so they can resubmit a corrected invoice.
         const staffRow = await db.select().from(staff).where(eq(staff.id, Number(existing[0].staffId))).limit(1);
@@ -5549,6 +5593,24 @@ app.post('/api/direct-messages', authenticateToken, async (req: any, res) => {
             text: String(text).trim(),
         });
 
+        try {
+            const preview = String(text).trim().slice(0, 140);
+            let targets: number[] = [];
+            if (senderRole === 'admin') {
+                if (recipientUserId) targets = [Number(recipientUserId)];
+                else {
+                    const st = await db.select({ id: users.id }).from(users).where(sql`LOWER(TRIM(${users.role})) = 'staff'`);
+                    targets = st.map((r) => Number(r.id));
+                }
+                await notifyUsers(db, targets, { type: 'direct_message', message: `Message from the office: ${preview}`, pushTitle: 'Message from the office', pushBody: preview });
+            } else {
+                targets = await listAdminUserIds(db);
+                await notifyUsers(db, targets, { type: 'direct_message', message: `${userName}: ${preview}`, pushTitle: `Message from ${userName}`, pushBody: preview });
+            }
+        } catch (e) {
+            console.warn('Direct message notify failed:', e);
+        }
+        broadcastSync('notifications');
         res.json({ success: true });
     } catch (error) {
         console.error('Direct message send error:', error);
@@ -5725,7 +5787,7 @@ app.get('/api/customer-invoices/:id/preview', authenticateToken, async (req: any
         const brandVars = await loadBrandVars(db);
         const lineItems = (inv.items as any[]) || [];
 
-        const fmtDur = (mins: number) => { const h = Math.floor(mins / 60); const m = mins % 60; return m ? `${h}h ${m}m` : `${h}h`; };
+        const fmtDur = (mins: number) => { const h = Math.floor(mins / 60); const m = mins % 60; return m ? `${h}h ${m}min` : `${h}h`; };
         const hasDuration = lineItems.some((li: any) => li.duration);
         const hasRate = lineItems.some((li: any) => li.hourlyRate);
 
@@ -5798,7 +5860,7 @@ app.post('/api/customer-invoices/:id/send', authenticateToken, async (req: any, 
         if (via === 'email' || via === 'both') {
             if (!inv.customerEmail) return res.status(400).json({ error: 'No customer email on this invoice' });
 
-            const fmtDur = (mins: number) => { const h = Math.floor(mins / 60); const m = mins % 60; return m ? `${h}h ${m}m` : `${h}h`; };
+            const fmtDur = (mins: number) => { const h = Math.floor(mins / 60); const m = mins % 60; return m ? `${h}h ${m}min` : `${h}h`; };
             const hasDuration = lineItems.some((li: any) => li.duration);
             const hasRate = lineItems.some((li: any) => li.hourlyRate);
 
@@ -6555,9 +6617,14 @@ app.post('/api/bookings/:id/chat', authenticateToken, async (req: any, res) => {
         }
 
         let senderName = req.user.email || req.user.role;
+        // Superadmins live in their own table, so their id is not a users.id (sender_id has a FK to users).
+        let senderUserId: number | null = req.user.id;
         if (req.user.role === 'admin') {
             const adminRec = await db.select().from(superadmins).where(eq(superadmins.id, req.user.id)).limit(1);
-            if (adminRec.length) senderName = adminRec[0].name;
+            if (adminRec.length) {
+                senderName = adminRec[0].name;
+                senderUserId = null;
+            }
         } else {
             const userRec = await db.select().from(users).where(eq(users.id, req.user.id)).limit(1);
             if (userRec.length) senderName = userRec[0].name;
@@ -6565,14 +6632,14 @@ app.post('/api/bookings/:id/chat', authenticateToken, async (req: any, res) => {
 
         await db.insert(bookingMessages).values({
             bookingId: numericId,
-            senderId: req.user.id,
+            senderId: senderUserId,
             senderRole: req.user.role,
             senderName,
             text: text.trim(),
         });
 
         try {
-            await notifyBookingChatRecipients(numericId, displayRef, b, req.user.id, req.user.role, senderName, text.trim());
+            await notifyBookingChatRecipients(numericId, displayRef, b, senderUserId ?? 0, req.user.role, senderName, text.trim());
         } catch (e) {
             console.warn('Chat notification insert failed:', e);
         }
@@ -6594,7 +6661,9 @@ app.get('/api/admin/chat-summaries', authenticateToken, async (req: any, res) =>
                 COALESCE(b.chat_closed_by_admin, 0) AS chat_closed,
                 (SELECT COUNT(*) FROM booking_messages m WHERE m.booking_id = b.id) AS msg_count,
                 (SELECT m.sender_role FROM booking_messages m WHERE m.booking_id = b.id ORDER BY m.created_at DESC LIMIT 1) AS last_sender_role,
-                (SELECT m.created_at FROM booking_messages m WHERE m.booking_id = b.id ORDER BY m.created_at DESC LIMIT 1) AS last_message_at
+                (SELECT m.created_at FROM booking_messages m WHERE m.booking_id = b.id ORDER BY m.created_at DESC LIMIT 1) AS last_message_at,
+                (SELECT LEFT(m.text, 140) FROM booking_messages m WHERE m.booking_id = b.id ORDER BY m.created_at DESC LIMIT 1) AS last_text,
+                (SELECT m.sender_name FROM booking_messages m WHERE m.booking_id = b.id ORDER BY m.created_at DESC LIMIT 1) AS last_sender_name
             FROM bookings b
             WHERE b.status IN ('Pending','Confirmed','Completed')
         `);
@@ -6606,6 +6675,8 @@ app.get('/api/admin/chat-summaries', authenticateToken, async (req: any, res) =>
             lastMessageAt: r.last_message_at
                 ? new Date(r.last_message_at as Date).toISOString()
                 : null,
+            lastText: r.last_text ? String(r.last_text) : null,
+            lastSenderName: r.last_sender_name ? String(r.last_sender_name) : null,
         }));
         res.json(list);
     } catch (e) {
@@ -6979,138 +7050,6 @@ app.post('/api/admin/broadcast/email-image', authenticateToken, async (req: any,
     } catch (e) {
         console.error('broadcast email-image', e);
         res.status(500).json({ error: 'Failed to save image' });
-    }
-});
-
-app.post('/api/admin/broadcast/email', authenticateToken, async (req: any, res) => {
-    if (!requireAdmin(req, res)) return;
-    try {
-        const { subject, body, content, audience, recipientType, specificEmails } = req.body;
-        // `content` / `recipientType` / `specificEmails` are the Communication Center's contract;
-        // `body` / `audience` are the segment-targeted one. Both are supported.
-        const messageBody = body ?? content;
-        if (!subject || !messageBody) return res.status(400).json({ error: 'Subject and body are required' });
-
-        const segment = String(
-            audience ?? (recipientType === 'all_users' ? 'all' : recipientType ?? 'all'),
-        );
-
-        // audience: 'all' | 'customers' | 'staff' | 'inactive' (no booking in 30+ days) | 'specific'
-        let recipients: Array<{ email: string; name: string; id: number }> = [];
-
-        if (segment === 'specific') {
-            const list = Array.isArray(specificEmails) ? specificEmails : [];
-            const wanted = list
-                .map((e: unknown) => String(e || '').trim().toLowerCase())
-                .filter((e: string) => isPlausibleEmail(e));
-            if (wanted.length === 0) {
-                return res.status(400).json({ error: 'Add at least one valid email address.' });
-            }
-            const known = await db
-                .select({ id: users.id, email: users.email, name: users.name })
-                .from(users)
-                .where(inArray(sql`LOWER(TRIM(${users.email}))`, wanted));
-            const byEmail = new Map(known.map((u) => [String(u.email || '').toLowerCase(), u]));
-            recipients = wanted.map((email: string) => {
-                const match = byEmail.get(email);
-                return { email, name: match?.name || 'there', id: match?.id ?? 0 };
-            });
-        } else if (segment === 'inactive') {
-            const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
-            const allCustomers = await db.select({ id: users.id, email: users.email, name: users.name })
-                .from(users)
-                .where(sql`LOWER(TRIM(${users.role})) = 'customer'`);
-            for (const c of allCustomers) {
-                if (!c.email) continue;
-                const recentBooking = await db.select({ id: bookings.id })
-                    .from(bookings)
-                    .where(and(eq(bookings.customerId, c.id), gte(bookings.date, thirtyDaysAgo)))
-                    .limit(1);
-                if (recentBooking.length === 0) {
-                    recipients.push({ email: c.email, name: c.name || 'Customer', id: c.id });
-                }
-            }
-        } else {
-            const roleFilter = segment === 'staff'
-                ? sql`LOWER(TRIM(${users.role})) IN ('staff', 'admin')`
-                : segment === 'customers'
-                    ? sql`LOWER(TRIM(${users.role})) = 'customer'`
-                    : sql`1=1`;
-            const allUsers = await db.select({ id: users.id, email: users.email, name: users.name })
-                .from(users)
-                .where(roleFilter);
-            recipients = allUsers.filter(u => u.email).map(u => ({
-                email: u.email!, name: u.name || 'User', id: u.id,
-            }));
-        }
-
-        if (recipients.length === 0) return res.json({ sent: 0, message: 'No matching recipients' });
-
-        const brand = await loadBrandVars(db);
-        let sentCount = 0;
-        const errors: string[] = [];
-
-        // Send in batches of 10 to avoid rate limits
-        for (let i = 0; i < recipients.length; i += 10) {
-            const batch = recipients.slice(i, i + 10);
-            for (const r of batch) {
-                try {
-                    const personalizedBody = String(messageBody)
-                        .replace(/\{\{client_name\}\}/g, r.name)
-                        .replace(/\{\{brand_name\}\}/g, String(brand.brand_name || 'CiN Cleaning'));
-                    const html = await wrapHtmlInEmailShell(db, personalizedBody, brand);
-                    await sendEmail({
-                        to: [{ email: r.email, name: r.name }],
-                        subject: subject.replace(/\{\{brand_name\}\}/g, String(brand.brand_name || 'CiN Cleaning')),
-                        htmlContent: html,
-                    });
-                    sentCount += 1;
-                } catch (e: any) {
-                    errors.push(`${r.email}: ${e.message || 'failed'}`);
-                }
-            }
-        }
-
-        res.json({ sent: sentCount, total: recipients.length, errors: errors.slice(0, 10) });
-    } catch (error) {
-        console.error('Bulk email error:', error);
-        res.status(500).json({ error: 'Failed to send bulk email' });
-    }
-});
-
-app.post('/api/admin/broadcast/notification', authenticateToken, async (req: any, res) => {
-    if (!requireAdmin(req, res)) return;
-    try {
-        const { message, recipientType } = req.body;
-
-        let targetUserIds: number[] = [];
-        if (recipientType === 'all_users') {
-            const all = await db.select().from(users);
-            targetUserIds = all.map(u => u.id);
-        } else if (recipientType === 'staff') {
-            const allStaff = await db.select().from(staff);
-            // Assuming staff table has userId or we join. 
-            // Simplification: fetch users where role='staff' or similar
-            const staffUsers = await db.select().from(users).where(eq(users.role, 'staff')); // Adjust based on schema
-            targetUserIds = staffUsers.map(u => u.id);
-        }
-
-        if (targetUserIds.length > 0) {
-            await db.insert(notifications).values(
-                targetUserIds.map(uid => ({
-                    userId: uid,
-                    type: 'system',
-                    message,
-                    isRead: false
-                }))
-            );
-        }
-
-        broadcastSync('notifications');
-        res.json({ message: 'Notifications broadcasted' });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Failed to broadcast notification' });
     }
 });
 

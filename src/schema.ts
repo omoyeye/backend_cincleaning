@@ -194,6 +194,49 @@ export const staff = mysqlTable('staff', {
     bankName: varchar('bank_name', { length: 100 }),
     accountNumber: varchar('account_number', { length: 50 }),
     sortCode: varchar('sort_code', { length: 20 }),
+    /** 'contracted' staff get paid holiday; 'self_employed' cannot book holiday. */
+    contractType: varchar('contract_type', { length: 20 }).default('self_employed'),
+    /** Paid holiday days per April to March year (max 26). */
+    holidayAllowanceDays: decimal('holiday_allowance_days', { precision: 4, scale: 1 }).default('26'),
+    /** Paid hours per holiday day; holiday pay = days x hours x hourly rate. */
+    holidayHoursPerDay: decimal('holiday_hours_per_day', { precision: 4, scale: 2 }).default('8'),
+});
+
+/** Paid holiday requests from contracted staff (holiday year runs 1 April to 31 March). */
+export const staffHolidays = mysqlTable('staff_holidays', {
+    id: int().primaryKey().autoincrement(),
+    staffId: int('staff_id').notNull().references(() => staff.id),
+    startDate: varchar('start_date', { length: 10 }).notNull(),
+    endDate: varchar('end_date', { length: 10 }).notNull(),
+    halfDay: boolean('half_day').default(false),
+    /** Weekdays booked (0.5 for a half day); admin may adjust on approval. */
+    days: decimal('days', { precision: 4, scale: 1 }).notNull(),
+    /** Start year of the holiday year, e.g. 2026 for April 2026 to March 2027. */
+    holidayYear: int('holiday_year').notNull(),
+    status: varchar('status', { length: 20 }).notNull().default('Pending'), // Pending | Approved | Rejected | Cancelled
+    note: text('note'),
+    adminNote: text('admin_note'),
+    decidedAt: timestamp('decided_at'),
+    /** unpaid | claimed (on a submitted weekly invoice) | paid (invoice approved) */
+    payStatus: varchar('pay_status', { length: 20 }).notNull().default('unpaid'),
+    payAmount: decimal('pay_amount', { precision: 10, scale: 2 }),
+    staffInvoiceId: int('staff_invoice_id'),
+    createdAt: timestamp('created_at').defaultNow(),
+    updatedAt: timestamp('updated_at').defaultNow(),
+});
+
+/** Log of admin broadcasts from the Communication hub. */
+export const broadcasts = mysqlTable('broadcasts', {
+    id: int().primaryKey().autoincrement(),
+    channel: varchar('channel', { length: 20 }).notNull(), // email | push | notification
+    audience: varchar('audience', { length: 30 }).notNull(),
+    subject: varchar('subject', { length: 255 }),
+    body: longtext('body').notNull(),
+    recipients: int('recipients').notNull().default(0),
+    sent: int('sent').notNull().default(0),
+    failed: int('failed').notNull().default(0),
+    createdBy: varchar('created_by', { length: 255 }),
+    createdAt: timestamp('created_at').defaultNow(),
 });
 
 export const businessSettings = mysqlTable('business_settings', {

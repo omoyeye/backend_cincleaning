@@ -1,3 +1,4 @@
+import { formatHoursMinutes } from '../shared/bookingHelpers';
 /** Build a single HTML table of booking details for transactional emails. */
 
 function esc(s: unknown): string {
@@ -37,7 +38,7 @@ function formatPropertyDetailsHtml(pd: Record<string, unknown> | null | undefine
     ['utilityRooms', 'Utility rooms'],
     ['clockRoomToilets', 'Clock / cloakroom toilets'],
     ['carpetSteamCleaning', 'Carpet steam cleaning'],
-    ['duration', 'Booked duration (h)'],
+    ['duration', 'Booked duration'],
     ['notifyIfMoreTimeNeeded', 'Notify if more time needed'],
     ['callOutCharge', 'Call-out charge (£)'],
     ['commercialDetails', 'Commercial / site details'],
@@ -50,7 +51,7 @@ function formatPropertyDetailsHtml(pd: Record<string, unknown> | null | undefine
       lines.push(`${label}: ${v ? 'Yes' : 'No'}`);
       continue;
     }
-    lines.push(`${label}: ${String(v)}`);
+    lines.push(`${label}: ${key === 'duration' && Number.isFinite(Number(v)) ? formatHoursMinutes(Number(v)) : String(v)}`);
   }
   for (const [k, v] of Object.entries(pd)) {
     if (order.some(([x]) => x === k)) continue;
@@ -97,12 +98,13 @@ export function buildBookingDetailsHtml(bookingData: any, opts: BuildBookingDeta
   const instructionsCell = instr ? esc(instr).replace(/\n/g, '<br />') : '-';
 
   const freq = String(bookingData.frequency || '-');
-  const duration =
+  const rawDuration =
     bookingData.duration != null && bookingData.duration !== ''
-      ? String(bookingData.duration)
+      ? Number(bookingData.duration)
       : pd && pd.duration != null
-        ? String(pd.duration)
-        : '-';
+        ? Number(pd.duration)
+        : NaN;
+  const duration = Number.isFinite(rawDuration) && rawDuration > 0 ? formatHoursMinutes(rawDuration) : '-';
 
   const discountCode = String(bookingData.discountCode || '').trim();
   const discLine =
@@ -121,7 +123,7 @@ export function buildBookingDetailsHtml(bookingData: any, opts: BuildBookingDeta
     row('Date', String(bookingData.date || '-')),
     row('Time', String(bookingData.time || '-')),
     row('Frequency', freq),
-    row('Duration (hours)', duration),
+    row('Duration', duration),
     row('Contact name', String(contact.name || '-')),
     row('Email', String(contact.email || '-')),
     row('Phone', String(contact.phone || '-')),

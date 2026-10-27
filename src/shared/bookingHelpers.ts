@@ -320,6 +320,16 @@ export interface DurationBreakdown {
 }
 
 /** Human-readable hours, e.g. 12, 11.5, 0.5 */
+/** Hours as "1h 30min", "45min" or "2h" for display. */
+export function formatHoursMinutes(hours: number): string {
+  if (!Number.isFinite(hours)) return '-';
+  const total = Math.round(hours * 60);
+  const h = Math.floor(total / 60);
+  const m = total % 60;
+  if (!h) return `${m}min`;
+  return m ? `${h}h ${m}min` : `${h}h`;
+}
+
 export function formatBookedHoursLabel(hours: number): string {
   if (!Number.isFinite(hours)) return '-';
   const rounded = roundHours(hours);
@@ -582,16 +592,16 @@ export function formatVisitWindowLabel(b: Booking, services: ServiceConfig[], ex
   const hrs = getBookingDurationHours(b, svc, extras);
   const startMs = parseBookingStartMs(b.date, b.time);
   if (!Number.isFinite(startMs)) {
-    return `${dateStr} ${startClock} (~${hrs}h est.)`;
+    return `${dateStr} ${startClock} (about ${formatHoursMinutes(hrs)})`;
   }
   const endMs = startMs + Math.max(1 / 60, hrs) * 3600000;
   const end = new Date(endMs);
   const endDate = getYYYYMMDD(end);
   const endClock = `${pad2(end.getHours())}:${pad2(end.getMinutes())}`;
   if (endDate !== dateStr) {
-    return `${dateStr} ${startClock} → ${endDate} ${endClock} (~${hrs}h est.)`;
+    return `${dateStr} ${startClock} → ${endDate} ${endClock} (about ${formatHoursMinutes(hrs)})`;
   }
-  return `${dateStr} ${startClock}–${endClock} (~${hrs}h est.)`;
+  return `${dateStr} ${startClock}–${endClock} (about ${formatHoursMinutes(hrs)})`;
 }
 
 export type OverlapConflictDetail = {

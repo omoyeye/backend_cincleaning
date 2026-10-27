@@ -14,6 +14,10 @@ const COLUMN_MIGRATIONS = [
     'ALTER TABLE `bookings` ADD COLUMN `balance_paid_amount` DECIMAL(10,2) NULL',
     'ALTER TABLE `bookings` ADD COLUMN `stripe_balance_intent_id` VARCHAR(255) NULL',
     'ALTER TABLE `bookings` ADD COLUMN `balance_request_sent_at` TIMESTAMP NULL DEFAULT NULL',
+    // Paid holiday for contracted staff.
+    "ALTER TABLE `staff` ADD COLUMN `contract_type` VARCHAR(20) NULL DEFAULT 'self_employed'",
+    "ALTER TABLE `staff` ADD COLUMN `holiday_allowance_days` DECIMAL(4,1) NULL DEFAULT 26",
+    "ALTER TABLE `staff` ADD COLUMN `holiday_hours_per_day` DECIMAL(4,2) NULL DEFAULT 8",
     // Public reviews: client consent to publish, and admin moderation.
     'ALTER TABLE `bookings` ADD COLUMN `review_public` BOOLEAN DEFAULT FALSE',
     'ALTER TABLE `bookings` ADD COLUMN `review_hidden` BOOLEAN DEFAULT FALSE',
@@ -120,6 +124,41 @@ const TABLE_MIGRATIONS = [
         UNIQUE KEY \`push_tokens_token_unique\` (\`token\`),
         KEY \`push_tokens_user_idx\` (\`user_id\`),
         CONSTRAINT \`push_tokens_user_id_users_id_fk\` FOREIGN KEY (\`user_id\`) REFERENCES \`users\` (\`id\`) ON DELETE CASCADE
+    )`,
+    `CREATE TABLE IF NOT EXISTS \`staff_holidays\` (
+        \`id\` INT NOT NULL AUTO_INCREMENT,
+        \`staff_id\` INT NOT NULL,
+        \`start_date\` VARCHAR(10) NOT NULL,
+        \`end_date\` VARCHAR(10) NOT NULL,
+        \`half_day\` BOOLEAN DEFAULT FALSE,
+        \`days\` DECIMAL(4,1) NOT NULL,
+        \`holiday_year\` INT NOT NULL,
+        \`status\` VARCHAR(20) NOT NULL DEFAULT 'Pending',
+        \`note\` TEXT NULL,
+        \`admin_note\` TEXT NULL,
+        \`decided_at\` TIMESTAMP NULL DEFAULT NULL,
+        \`pay_status\` VARCHAR(20) NOT NULL DEFAULT 'unpaid',
+        \`pay_amount\` DECIMAL(10,2) NULL,
+        \`staff_invoice_id\` INT NULL,
+        \`created_at\` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        \`updated_at\` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (\`id\`),
+        KEY \`staff_holidays_staff_year_idx\` (\`staff_id\`, \`holiday_year\`),
+        CONSTRAINT \`staff_holidays_staff_id_staff_id_fk\` FOREIGN KEY (\`staff_id\`) REFERENCES \`staff\` (\`id\`) ON DELETE CASCADE
+    )`,
+    `CREATE TABLE IF NOT EXISTS \`broadcasts\` (
+        \`id\` INT NOT NULL AUTO_INCREMENT,
+        \`channel\` VARCHAR(20) NOT NULL,
+        \`audience\` VARCHAR(30) NOT NULL,
+        \`subject\` VARCHAR(255) NULL,
+        \`body\` LONGTEXT NOT NULL,
+        \`recipients\` INT NOT NULL DEFAULT 0,
+        \`sent\` INT NOT NULL DEFAULT 0,
+        \`failed\` INT NOT NULL DEFAULT 0,
+        \`created_by\` VARCHAR(255) NULL,
+        \`created_at\` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (\`id\`),
+        KEY \`broadcasts_created_idx\` (\`created_at\`)
     )`,
     `CREATE TABLE IF NOT EXISTS \`staff_assessments\` (
         \`id\` INT NOT NULL AUTO_INCREMENT,

@@ -4,6 +4,7 @@ import { quoteLeads, quoteOffers } from './schema';
 import { loadBrandVars } from './messageTemplates/brand';
 import { renderTransactionalEmail } from './messageTemplates/engine';
 import { sendEmail } from './services/email';
+import { formatHoursMinutes } from './shared/bookingHelpers';
 
 type Auth = (req: any, res: any, next: any) => void;
 type Deps = {
@@ -228,7 +229,7 @@ function jobHtml(q: QuoteContent): string {
     const pairs: [string, string][] = [];
     if (q.serviceType) pairs.push(['Service', q.serviceType]);
     if (d?.frequency) pairs.push(['Frequency', d.frequency]);
-    if (d?.pricingModel === 'hourly' && d.hours) pairs.push(['Duration', `${d.hours} hour${d.hours === 1 ? '' : 's'}`]);
+    if (d?.pricingModel === 'hourly' && d.hours) pairs.push(['Duration', formatHoursMinutes(Number(d.hours))]);
     if (d?.pricingModel === 'hourly' && d.hourlyRate) {
         pairs.push(['Hourly rate', `£${money(d.hourlyRate)} per hour${d.region === 'london' ? ' (London rate)' : ''}`]);
     }
