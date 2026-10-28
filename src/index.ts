@@ -96,6 +96,10 @@ import {
     referralInvoiceLines,
     markReferralsClaimed,
     syncReferralPayForInvoice,
+    createReferralOnSignup,
+    canApplyReferralCode,
+    pointsToPounds,
+    restoreLoyaltyPointsForBooking,
 } from './referralRewards';
 import { registerStaffPerformanceRoutes } from './staffPerformance';
 import { registerQuoteOfferRoutes } from './quoteOffers';
@@ -1641,6 +1645,30 @@ app.get('/api/referrals', authenticateToken, async (req: any, res) => {
     }
 });
 
+/** A signed-in client who has not been referred yet (and has not had a clean) adds a friend's code. */
+app.post('/api/referrals/apply', authenticateToken, async (req: any, res) => {
+    try {
+        const code = String(req.body?.code || '').trim().toUpperCase();
+        if (!code) return res.status(400).json({ error: 'Enter a referral code.' });
+        const [me] = await db.select().from(users).where(eq(users.id, Number(req.user.id))).limit(1);
+        if (!me) return res.status(404).json({ error: 'User not found' });
+        if (me.referredBy) return res.status(400).json({ error: 'You have already used a referral code.' });
+        if (!(await canApplyReferralCode(db, me))) {
+            return res.status(400).json({ error: 'Referral codes are for new clients before their first clean.' });
+        }
+        const [referrer] = await db.select().from(users).where(eq(users.referralCode, code)).limit(1);
+        if (!referrer) return res.status(400).json({ error: 'That referral code was not recognised.' });
+        if (referrer.id === me.id) return res.status(400).json({ error: 'You cannot use your own referral code.' });
+        await db.update(users).set({ referredBy: referrer.referralCode }).where(eq(users.id, me.id));
+        const rewardAmount = getReferralRewardAmount(await loadBusinessSettingsMap(db));
+        const { welcomeCredit } = await createReferralOnSignup(db, rewardAmount, me, referrer.id);
+        res.json({ welcomeCredit, credit: await referralCreditBalance(db, me.id) });
+    } catch (error) {
+        console.error('Apply referral code error:', error);
+        res.status(500).json({ error: 'Could not add the referral code' });
+    }
+});
+
 /** The signed-in user's referral balance: cleaning credit for clients, claimable bonuses for staff. */
 app.get('/api/referrals/summary', authenticateToken, async (req: any, res) => {
     try {
@@ -1664,7 +1692,11 @@ app.get('/api/referrals/summary', authenticateToken, async (req: any, res) => {
                     claimed: sum(rewards.filter((r) => r.status === 'available' && r.payStatus === 'claimed')),
                     paid: sum(rewards.filter((r) => r.status === 'available' && r.payStatus === 'paid')),
                 }
-                : { credit: await referralCreditBalance(db, userId) }),
+                : {
+                    credit: await referralCreditBalance(db, userId),
+                    points: { balance: Number(me.loyaltyPoints || 0), value: pointsToPounds(Number(me.loyaltyPoints || 0)) },
+                    canApplyCode: await canApplyReferralCode(db, me),
+                }),
         });
     } catch (error) {
         console.error('Referral summary error:', error);
@@ -2252,14 +2284,14 @@ app.post('/api/register', async (req, res) => {
         if (!name) {
             return res.status(400).json({ error: 'Name is required' });
         }
-        console.log("REGISTER INPUTS:", { email, referredBy, hasPhone: !!phone });
-
-        if (referredBy) {
-            const referrer = await db.select().from(users).where(eq(users.referralCode, referredBy));
-            console.log("REFERRER FOUND:", referrer);
-            if (!referrer.length) {
-                return res.status(400).json({ error: 'Invalid referral code.' });
+        const referralInput = referredBy ? String(referredBy).trim().toUpperCase() : '';
+        let referrerRow: typeof users.$inferSelect | null = null;
+        if (referralInput) {
+            const [found] = await db.select().from(users).where(eq(users.referralCode, referralInput)).limit(1);
+            if (!found) {
+                return res.status(400).json({ error: 'That referral code was not recognised. Check it or leave it blank.' });
             }
+            referrerRow = found;
         }
 
         const existing = await db.select().from(users).where(eq(users.email, email)).limit(1);
@@ -2278,7 +2310,7 @@ app.post('/api/register', async (req, res) => {
             role: 'customer',
             isVerified: false,
             referralCode,
-            referredBy, // Nullable
+            referredBy: referrerRow?.referralCode ?? null,
             loyaltyPoints: 0,
             phone,
         }).$returningId();
@@ -2289,6 +2321,13 @@ app.post('/api/register', async (req, res) => {
         await db.update(bookings)
             .set({ customerId: newUserId })
             .where(eq(bookings.contactEmail, email));
+
+        // Joined with a friend's code: welcome credit for the first booking (not for someone who already had a clean).
+        let welcomeCredit = 0;
+        if (referrerRow) {
+            const rewardAmount = getReferralRewardAmount(await loadBusinessSettingsMap(db));
+            ({ welcomeCredit } = await createReferralOnSignup(db, rewardAmount, { id: newUserId, email }, referrerRow.id));
+        }
 
         const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(referralCode)}`;
 
@@ -2343,6 +2382,7 @@ app.post('/api/register', async (req, res) => {
             referralCode,
             token: regToken,
             user: { id: newUserId, name, email, role: 'customer', isVerified: false, referralCode, loyaltyPoints: 0, phone },
+            ...(welcomeCredit > 0 ? { welcomeCredit } : {}),
         });
     } catch (error) {
         console.error("Registration Error:", error);
@@ -3115,6 +3155,33 @@ app.post('/api/bookings', async (req, res) => {
             }
         }
 
+        // Loyalty points (10 points = £1, whole pounds, cleaning only): only when the client ticks "use my points".
+        let pointsRedeemed = 0;
+        let pointsDiscount = 0;
+        if (
+            bookingData.usePoints === true &&
+            sessionUser && String(sessionUser.role) === 'customer' && Number(validCustomerId) === Number(sessionUser.id)
+        ) {
+            const [cust] = await db.select({ loyaltyPoints: users.loyaltyPoints }).from(users).where(eq(users.id, Number(sessionUser.id))).limit(1);
+            const remaining = Number.parseFloat(String(bookingData.totalPrice ?? 0)) || 0;
+            const pounds = Math.min(pointsToPounds(Number(cust?.loyaltyPoints || 0)), Math.floor(remaining));
+            if (pounds > 0) {
+                const spend = pounds * 10;
+                // Take the points only if they are still there (two bookings at once cannot both spend them).
+                const [taken] = await db
+                    .update(users)
+                    .set({ loyaltyPoints: sql`${users.loyaltyPoints} - ${spend}` })
+                    .where(and(eq(users.id, Number(sessionUser.id)), gte(users.loyaltyPoints, spend)));
+                if ((taken as any)?.affectedRows) {
+                    pointsRedeemed = spend;
+                    pointsDiscount = pounds;
+                    bookingData.totalPrice = Math.max(0, remaining - pounds).toFixed(2);
+                }
+            }
+        }
+        // Points are earned on what the client actually pays.
+        pointsToEarn = Math.floor((Number.parseFloat(String(bookingData.totalPrice ?? 0)) || 0) / 10);
+
         const insertedRows = await db
             .insert(bookings)
             .values({
@@ -3141,6 +3208,8 @@ app.post('/api/bookings', async (req, res) => {
                 priceRegion: serverPrice?.region ?? null,
                 hourlyRate: serverPrice ? serverPrice.hourlyRate.toFixed(2) : null,
                 referralCreditUsed: referralCreditUsed > 0 ? referralCreditUsed.toFixed(2) : null,
+                pointsRedeemed: pointsRedeemed || null,
+                pointsDiscount: pointsDiscount > 0 ? pointsDiscount.toFixed(2) : null,
             })
             .$returningId();
         const numericBookingId = Number(insertedRows[0]?.id);
@@ -3321,6 +3390,7 @@ app.post('/api/bookings', async (req, res) => {
             depositTermsAcceptedAt: new Date().toISOString(),
             totalPrice: Number.parseFloat(String(bookingData.totalPrice ?? 0)) || 0,
             ...(referralCreditUsed > 0 ? { referralCreditUsed } : {}),
+            ...(pointsRedeemed > 0 ? { pointsRedeemed, pointsDiscount } : {}),
             ...(stripePaymentLinkForResponse ? { stripePaymentLink: stripePaymentLinkForResponse } : {}),
             ...(conflictWarning ? { conflictWarning } : {}),
         });
@@ -3455,7 +3525,7 @@ const CLIENT_PAYMENT_FIELDS = [
     'discountCode', 'discountAmount', 'hourlyRate', 'priceRegion',
     'depositPaidAt', 'depositPaidAmount', 'paymentChoice', 'paidInFullAt', 'balancePaidAmount',
     'stripeBalanceIntentId', 'balanceRequestSentAt', 'stripePaymentLink', 'stripePaymentIntentId',
-    'depositTermsAcceptedAt', 'shortNoticeCancelFeeConsentedAt', 'paymentFeeEvidence', 'invoicePaid', 'referralCreditUsed',
+    'depositTermsAcceptedAt', 'shortNoticeCancelFeeConsentedAt', 'paymentFeeEvidence', 'invoicePaid', 'referralCreditUsed', 'pointsRedeemed', 'pointsDiscount', 'pointsEarned',
 ] as const;
 const MONEY_KEY = /price|total|amount|fee|charge|cost|deposit|discount|paid|payment|rate|balance/i;
 
@@ -4372,7 +4442,10 @@ app.patch('/api/bookings/:id', authenticateToken, async (req: any, res) => {
         }
 
         if (bookingUpdates.status && bookingUpdates.status !== booking.status) {
-            if (bookingUpdates.status === 'Cancelled') await restoreReferralCreditForBooking(db, id);
+            if (bookingUpdates.status === 'Cancelled') {
+                await restoreReferralCreditForBooking(db, id);
+                await restoreLoyaltyPointsForBooking(db, id);
+            }
             if (bookingUpdates.status === 'Completed') {
                 await unlockReferralForBooking(db, getReferralRewardAmount(await loadBusinessSettingsMap(db)), booking);
             }

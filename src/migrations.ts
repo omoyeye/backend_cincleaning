@@ -40,6 +40,11 @@ const COLUMN_MIGRATIONS = [
     'ALTER TABLE `services` ADD COLUMN `london_rate` DECIMAL(10,2) NULL DEFAULT NULL',
     // Referral credit a client used on a booking.
     'ALTER TABLE `bookings` ADD COLUMN `referral_credit_used` DECIMAL(10,2) NULL',
+    // Welcome credit for a friend who joined with a referral code.
+    'ALTER TABLE `referral_rewards` ADD COLUMN `friend_amount` DECIMAL(10,2) NOT NULL DEFAULT 0',
+    // Loyalty points spent on a booking.
+    'ALTER TABLE `bookings` ADD COLUMN `points_redeemed` INT NULL',
+    'ALTER TABLE `bookings` ADD COLUMN `points_discount` DECIMAL(10,2) NULL',
     'ALTER TABLE `bookings` ADD COLUMN `price_region` VARCHAR(20) NULL DEFAULT NULL',
     'ALTER TABLE `bookings` ADD COLUMN `hourly_rate` DECIMAL(10,2) NULL DEFAULT NULL',
     'ALTER TABLE `quote_leads` ADD COLUMN `admin_notes` TEXT NULL',

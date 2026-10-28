@@ -135,19 +135,59 @@ export async function unlockReferralForBooking(
     }
 }
 
-/** Unlocked credit a client has, what they have used, and what is left. */
-export async function referralCreditBalance(db: any, userId: number): Promise<{ earned: number; used: number; balance: number }> {
+/**
+ * Links a new client to the friend who referred them and gives them welcome credit for their first booking.
+ * Someone who has already had a clean with us is not a new friend: no welcome credit and no reward for the referrer.
+ */
+export async function createReferralOnSignup(
+    db: any,
+    rewardAmount: number,
+    friend: Pick<UserRow, 'id' | 'email'>,
+    referrerUserId: number,
+): Promise<{ welcomeCredit: number }> {
+    if (!referrerUserId || referrerUserId === friend.id) return { welcomeCredit: 0 };
+    const alreadyCleaned = !!(await firstCompletedBookingId(db, friend));
+    try {
+        await db.insert(referralRewards).values({
+            referrerUserId,
+            referredUserId: friend.id,
+            amount: rewardAmount.toFixed(2),
+            friendAmount: alreadyCleaned ? '0' : rewardAmount.toFixed(2),
+            status: alreadyCleaned ? 'rejected' : 'pending',
+        });
+    } catch {
+        return { welcomeCredit: 0 }; // Already linked.
+    }
+    return { welcomeCredit: alreadyCleaned ? 0 : rewardAmount };
+}
+
+/** A signed-in client can still add a code if nobody referred them yet and they have not had a clean. */
+export async function canApplyReferralCode(db: any, user: UserRow): Promise<boolean> {
+    if (String(user.role || '').toLowerCase() !== 'customer' || user.referredBy) return false;
+    return !(await firstCompletedBookingId(db, user));
+}
+
+/** Points are worth £1 per 10, in whole pounds. */
+export const pointsToPounds = (points: number) => Math.floor(Math.max(0, Number(points) || 0) / 10);
+
+/** Unlocked credit a client has (referral rewards plus their own welcome credit), what they have used, and what is left. */
+export async function referralCreditBalance(db: any, userId: number): Promise<{ earned: number; used: number; balance: number; welcome: number }> {
     const [earnedRow] = await db
         .select({ total: sql<string>`COALESCE(SUM(${referralRewards.amount}), 0)` })
         .from(referralRewards)
         .where(and(eq(referralRewards.referrerUserId, userId), eq(referralRewards.status, 'available')));
+    const [welcomeRow] = await db
+        .select({ total: sql<string>`COALESCE(SUM(${referralRewards.friendAmount}), 0)` })
+        .from(referralRewards)
+        .where(and(eq(referralRewards.referredUserId, userId), sql`${referralRewards.status} <> 'rejected'`));
     const [usedRow] = await db
         .select({ total: sql<string>`COALESCE(SUM(${referralCreditUses.amount}), 0)` })
         .from(referralCreditUses)
         .where(and(eq(referralCreditUses.userId, userId), eq(referralCreditUses.status, 'applied')));
-    const earned = round2(Number(earnedRow?.total) || 0);
+    const welcome = round2(Number(welcomeRow?.total) || 0);
+    const earned = round2((Number(earnedRow?.total) || 0) + welcome);
     const used = round2(Number(usedRow?.total) || 0);
-    return { earned, used, balance: round2(Math.max(0, earned - used)) };
+    return { earned, used, balance: round2(Math.max(0, earned - used)), welcome };
 }
 
 /** How much credit to take off a new booking for this client (never more than the booking total). */
@@ -182,6 +222,26 @@ export async function restoreReferralCreditForBooking(db: any, bookingId: number
         inApp: true,
     }).catch(() => {});
     return total;
+}
+
+/** Gives loyalty points back when a booking that spent them is cancelled. */
+export async function restoreLoyaltyPointsForBooking(db: any, bookingId: number): Promise<number> {
+    const [b] = await db.select().from(bookings).where(eq(bookings.id, bookingId)).limit(1);
+    const pts = Number(b?.pointsRedeemed) || 0;
+    if (!b || pts <= 0 || !b.customerId) return 0;
+    // Clear the booking first so a second cancel can never give the points back twice.
+    const cleared = await db
+        .update(bookings)
+        .set({ pointsRedeemed: 0 })
+        .where(and(eq(bookings.id, bookingId), sql`${bookings.pointsRedeemed} > 0`));
+    if (!(cleared?.[0]?.affectedRows ?? 1)) return 0;
+    await db.update(users).set({ loyaltyPoints: sql`COALESCE(${users.loyaltyPoints}, 0) + ${pts}` }).where(eq(users.id, b.customerId));
+    await notifyUsers(db, [b.customerId], {
+        type: 'promo',
+        message: `${pts} loyalty points are back in your account because that booking was cancelled.`,
+        pushTitle: 'Points returned',
+    }).catch(() => {});
+    return pts;
 }
 
 /** Rewards for one referrer, keyed by the referred user id. */

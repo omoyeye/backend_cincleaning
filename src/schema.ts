@@ -150,6 +150,9 @@ export const bookings = mysqlTable('bookings', {
     hourlyRate: decimal('hourly_rate', { precision: 10, scale: 2 }),
     /** Referral credit taken off this booking's total (clients only; cleaning credit, no cash value). */
     referralCreditUsed: decimal('referral_credit_used', { precision: 10, scale: 2 }),
+    /** Loyalty points spent on this booking (10 points = £1) and the amount taken off; points come back if it is cancelled. */
+    pointsRedeemed: int('points_redeemed'),
+    pointsDiscount: decimal('points_discount', { precision: 10, scale: 2 }),
 
     /** When an assigned cleaner tapped "Start travel" for this job. */
     enRouteAt: timestamp('en_route_at'),
@@ -236,6 +239,8 @@ export const referralRewards = mysqlTable('referral_rewards', {
     referrerUserId: int('referrer_user_id').notNull(),
     referredUserId: int('referred_user_id').notNull().unique(),
     amount: decimal('amount', { precision: 10, scale: 2 }).notNull(),
+    /** Welcome credit for the friend who joined with the code (cleaning credit for their first booking). */
+    friendAmount: decimal('friend_amount', { precision: 10, scale: 2 }).notNull().default('0'),
     status: varchar('status', { length: 20 }).notNull().default('pending'), // pending | available | rejected
     unlockedAt: timestamp('unlocked_at'),
     unlockedByBookingId: int('unlocked_by_booking_id'),
