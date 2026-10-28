@@ -31,6 +31,7 @@ import {
     quoteOffers,
     directMessages,
     expenses,
+    referralRewards,
 } from './schema';
 import { slugify } from './seed/blogGallerySeed';
 import { sendEmail } from './services/email';
@@ -83,6 +84,19 @@ import { runColumnMigrations } from './migrations';
 import { registerStaffAssessmentRoutes } from './staffAssessments';
 import { registerBroadcastRoutes } from './broadcasts';
 import { registerStaffHolidayRoutes, holidayInvoiceLines, markHolidaysClaimed, syncHolidayPayForInvoice, MAX_HOLIDAY_DAYS } from './staffHolidays';
+import {
+    syncReferralRewards,
+    unlockReferralForBooking,
+    referralCreditBalance,
+    referralCreditFor,
+    recordReferralCreditUse,
+    restoreReferralCreditForBooking,
+    rewardsForReferrer,
+    claimableReferralBonuses,
+    referralInvoiceLines,
+    markReferralsClaimed,
+    syncReferralPayForInvoice,
+} from './referralRewards';
 import { registerStaffPerformanceRoutes } from './staffPerformance';
 import { registerQuoteOfferRoutes } from './quoteOffers';
 import { registerBusinessReportRoutes, startWeeklyReportSchedule } from './businessReports';
@@ -1257,6 +1271,17 @@ const authenticateToken = (req: any, res: any, next: any) => {
     });
 };
 
+/** The signed-in user for routes guests can also use; null when there is no valid session. */
+function optionalSessionUser(req: any): { id: number; role: string; email?: string } | null {
+    const token = getSessionTokenFromRequest(req);
+    if (!token) return null;
+    try {
+        return jwt.verify(token, JWT_SECRET) as { id: number; role: string; email?: string };
+    } catch {
+        return null;
+    }
+}
+
 app.post('/api/logout', (_req, res) => {
     clearAuthCookie(res);
     res.json({ ok: true });
@@ -1515,6 +1540,14 @@ app.patch('/api/users/:id', authenticateToken, async (req: any, res) => {
 });
 
 // Referrals
+/** Status shown in the portals: Pending until the friend's first clean; Paid Out once a staff bonus is paid. */
+function referralStatusLabel(r: { status: string; payStatus: string } | undefined): string {
+    if (r?.payStatus === 'paid') return 'Paid Out';
+    if (r?.status === 'available') return 'Completed';
+    if (r?.status === 'rejected') return 'Rejected';
+    return 'Pending';
+}
+
 app.get('/api/referrals', authenticateToken, async (req: any, res) => {
     try {
         const { userId, type } = req.query;
@@ -1545,24 +1578,35 @@ app.get('/api/referrals', authenticateToken, async (req: any, res) => {
             const referrer = await db.select().from(users).where(eq(users.id, referrerUserId));
             if (!referrer.length) return res.json([]);
             const code = referrer[0].referralCode;
-            const referred = await db.select().from(users).where(eq(users.referredBy, code ?? ''));
+            if (!code) return res.json([]);
+            await syncReferralRewards(db, referralRewardAmount, referrerUserId);
+            const referred = await db.select().from(users).where(eq(users.referredBy, code));
+            const rewards = await rewardsForReferrer(db, referrerUserId);
 
-            const results = referred.map(u => ({
-                id: `ref-${u.id}`,
-                referrerId: referrerUserId,
-                referrerName: referrer[0].name,
-                referrerType: String(type || '').toLowerCase() === 'staff' ? 'staff' : 'customer',
-                referredClientName: u.name,
-                dateReferred: u.createdAt,
-                status: u.isVerified ? 'Completed' : 'Pending',
-                rewardAmount: referralRewardAmount
-            }));
+            const results = referred.map(u => {
+                const r = rewards.get(u.id);
+                return {
+                    id: `ref-${u.id}`,
+                    referrerId: referrerUserId,
+                    referrerName: referrer[0].name,
+                    referrerType: String(referrer[0].role || type || '').toLowerCase() === 'staff' ? 'staff' : 'customer',
+                    referredClientName: u.name,
+                    dateReferred: u.createdAt,
+                    /** Pending until the friend's first clean is completed; Paid Out once a staff bonus is paid. */
+                    status: referralStatusLabel(r),
+                    rewardAmount: r ? Number(r.amount) : referralRewardAmount,
+                    payStatus: r?.payStatus ?? 'unpaid',
+                };
+            });
             return res.json(results);
         }
 
         if (req.user.role !== 'admin') return res.status(403).json({ error: 'Unauthorized' });
         // Admins see normalized referral rows across customer + staff referrers.
+        await syncReferralRewards(db, referralRewardAmount);
         const referredRows = await db.select().from(users).where(sql`referred_by IS NOT NULL`);
+        const rewardRows = await db.select().from(referralRewards);
+        const rewardByReferred = new Map(rewardRows.map((r) => [r.referredUserId, r]));
         const codes = Array.from(
             new Set(
                 referredRows
@@ -1586,13 +1630,45 @@ app.get('/api/referrals', authenticateToken, async (req: any, res) => {
                 referrerType: refRole === 'staff' ? 'staff' : 'customer',
                 referredClientName: u.name,
                 dateReferred: u.createdAt,
-                status: u.isVerified ? 'Completed' : 'Pending',
-                rewardAmount: referralRewardAmount,
+                status: referralStatusLabel(rewardByReferred.get(u.id)),
+                rewardAmount: Number(rewardByReferred.get(u.id)?.amount ?? referralRewardAmount),
+                payStatus: rewardByReferred.get(u.id)?.payStatus ?? 'unpaid',
             };
         });
         res.json(results);
     } catch (error) {
         res.status(500).json({ error: 'Failed to fetch referrals' });
+    }
+});
+
+/** The signed-in user's referral balance: cleaning credit for clients, claimable bonuses for staff. */
+app.get('/api/referrals/summary', authenticateToken, async (req: any, res) => {
+    try {
+        const userId = Number(req.user.id);
+        const [me] = await db.select().from(users).where(eq(users.id, userId)).limit(1);
+        if (!me) return res.status(404).json({ error: 'User not found' });
+        const rewardAmount = getReferralRewardAmount(await loadBusinessSettingsMap(db));
+        await syncReferralRewards(db, rewardAmount, userId);
+        const rewards = [...(await rewardsForReferrer(db, userId)).values()];
+        const sum = (list: typeof rewards) => Math.round(list.reduce((s, r) => s + Number(r.amount || 0), 0) * 100) / 100;
+        const isStaff = String(me.role || '').toLowerCase() === 'staff';
+        res.json({
+            role: isStaff ? 'staff' : 'customer',
+            code: me.referralCode,
+            rewardAmount,
+            pending: sum(rewards.filter((r) => r.status === 'pending')),
+            unlocked: sum(rewards.filter((r) => r.status === 'available')),
+            ...(isStaff
+                ? {
+                    claimable: await claimableReferralBonuses(db, userId),
+                    claimed: sum(rewards.filter((r) => r.status === 'available' && r.payStatus === 'claimed')),
+                    paid: sum(rewards.filter((r) => r.status === 'available' && r.payStatus === 'paid')),
+                }
+                : { credit: await referralCreditBalance(db, userId) }),
+        });
+    } catch (error) {
+        console.error('Referral summary error:', error);
+        res.status(500).json({ error: 'Failed to load referral rewards' });
     }
 });
 
@@ -1898,6 +1974,33 @@ app.patch('/api/referrals/:referralId', authenticateToken, async (req: any, res)
         const { status, rewardAmount } = req.body || {};
         if (status === 'Completed' || status === 'Pending') {
             await db.update(users).set({ isVerified: status === 'Completed' }).where(eq(users.id, userId));
+            await syncReferralRewards(db, getReferralRewardAmount(await loadBusinessSettingsMap(db)));
+            if (status === 'Completed') {
+                await db.update(referralRewards)
+                    .set({ status: 'available', unlockedAt: new Date() })
+                    .where(and(eq(referralRewards.referredUserId, userId), eq(referralRewards.status, 'pending')));
+            } else {
+                // Only a reward nobody has been paid for can go back to pending.
+                await db.update(referralRewards)
+                    .set({ status: 'pending', unlockedAt: null })
+                    .where(and(eq(referralRewards.referredUserId, userId), eq(referralRewards.payStatus, 'unpaid')));
+            }
+        } else if (status === 'Paid Out') {
+            // Staff bonus paid outside a weekly invoice. Client rewards are cleaning credit, used on bookings.
+            await syncReferralRewards(db, getReferralRewardAmount(await loadBusinessSettingsMap(db)));
+            const [reward] = await db.select().from(referralRewards).where(eq(referralRewards.referredUserId, userId)).limit(1);
+            if (!reward) return res.status(404).json({ error: 'Referral not found' });
+            const [referrer] = await db.select().from(users).where(eq(users.id, reward.referrerUserId)).limit(1);
+            if (String(referrer?.role || '').toLowerCase() !== 'staff') {
+                return res.status(400).json({ error: 'Client referral rewards are cleaning credit and come off their next booking automatically.' });
+            }
+            if (reward.payStatus === 'claimed') {
+                return res.status(400).json({ error: 'This bonus is on a staff weekly invoice. Approve that invoice to mark it paid.' });
+            }
+            await db.update(users).set({ isVerified: true }).where(eq(users.id, userId));
+            await db.update(referralRewards)
+                .set({ status: 'available', payStatus: 'paid', unlockedAt: reward.unlockedAt ?? new Date() })
+                .where(eq(referralRewards.id, reward.id));
         }
         if (rewardAmount !== undefined && rewardAmount !== null && rewardAmount !== '') {
             const parsed = Number(rewardAmount);
@@ -3001,6 +3104,17 @@ app.post('/api/bookings', async (req, res) => {
             }
         }
 
+        // Referral credit (cleaning credit, no cash value): only for the signed-in client booking for themselves.
+        let referralCreditUsed = 0;
+        const sessionUser = optionalSessionUser(req);
+        if (sessionUser && String(sessionUser.role) === 'customer' && Number(validCustomerId) === Number(sessionUser.id)) {
+            const total = Number.parseFloat(String(bookingData.totalPrice ?? 0)) || 0;
+            referralCreditUsed = await referralCreditFor(db, Number(sessionUser.id), total);
+            if (referralCreditUsed > 0) {
+                bookingData.totalPrice = Math.max(0, total - referralCreditUsed).toFixed(2);
+            }
+        }
+
         const insertedRows = await db
             .insert(bookings)
             .values({
@@ -3026,11 +3140,15 @@ app.post('/api/bookings', async (req, res) => {
                 paymentChoice: normalizeChoice(bookingData.paymentChoice),
                 priceRegion: serverPrice?.region ?? null,
                 hourlyRate: serverPrice ? serverPrice.hourlyRate.toFixed(2) : null,
+                referralCreditUsed: referralCreditUsed > 0 ? referralCreditUsed.toFixed(2) : null,
             })
             .$returningId();
         const numericBookingId = Number(insertedRows[0]?.id);
         if (!Number.isFinite(numericBookingId) || numericBookingId <= 0) {
             throw new Error('Failed to obtain new booking primary key');
+        }
+        if (referralCreditUsed > 0) {
+            await recordReferralCreditUse(db, Number(validCustomerId), numericBookingId, referralCreditUsed);
         }
 
         // Trigger Notification if we resolved a customer (body or email match)
@@ -3201,6 +3319,8 @@ app.post('/api/bookings', async (req, res) => {
             bookingId: publicBookingId,
             message: 'Booking created successfully',
             depositTermsAcceptedAt: new Date().toISOString(),
+            totalPrice: Number.parseFloat(String(bookingData.totalPrice ?? 0)) || 0,
+            ...(referralCreditUsed > 0 ? { referralCreditUsed } : {}),
             ...(stripePaymentLinkForResponse ? { stripePaymentLink: stripePaymentLinkForResponse } : {}),
             ...(conflictWarning ? { conflictWarning } : {}),
         });
@@ -3330,7 +3450,27 @@ app.get('/api/bookings/:id', authenticateToken, async (req: any, res) => {
     }
 });
 
-/** Shapes booking rows for portal clients (nested contact/address, merged staff ids; staff never see price or client contact details). */
+/** What the client pays and how: none of this is ever sent to a cleaner. */
+const CLIENT_PAYMENT_FIELDS = [
+    'discountCode', 'discountAmount', 'hourlyRate', 'priceRegion',
+    'depositPaidAt', 'depositPaidAmount', 'paymentChoice', 'paidInFullAt', 'balancePaidAmount',
+    'stripeBalanceIntentId', 'balanceRequestSentAt', 'stripePaymentLink', 'stripePaymentIntentId',
+    'depositTermsAcceptedAt', 'shortNoticeCancelFeeConsentedAt', 'paymentFeeEvidence', 'invoicePaid', 'referralCreditUsed',
+] as const;
+const MONEY_KEY = /price|total|amount|fee|charge|cost|deposit|discount|paid|payment|rate|balance/i;
+
+/** Strips client payment details from a booking a cleaner is about to see (they only see their own pay). */
+function withoutClientPayments<T extends Record<string, any>>(row: T): T {
+    const out: Record<string, any> = { ...row };
+    for (const key of CLIENT_PAYMENT_FIELDS) delete out[key];
+    const pd = out.propertyDetails;
+    if (pd && typeof pd === 'object' && !Array.isArray(pd)) {
+        out.propertyDetails = Object.fromEntries(Object.entries(pd).filter(([k]) => !MONEY_KEY.test(k)));
+    }
+    return out as T;
+}
+
+/** Shapes booking rows for portal clients (nested contact/address, merged staff ids; staff never see price, payments or client contact details). */
 async function enrichBookingsForViewer(results: any[], isStaffViewer: boolean) {
         const depositPct = isStaffViewer ? 40 : depositPercentOf(await loadBusinessSettingsMap(db));
         const resultIds = results.map(b => Number(b.id)).filter(id => Number.isFinite(id) && id > 0);
@@ -3361,7 +3501,7 @@ async function enrichBookingsForViewer(results: any[], isStaffViewer: boolean) {
             for (const sid of fromLinks) mergedStaffIds.add(Number(sid));
             if (b.assignedStaffId != null) mergedStaffIds.add(Number(b.assignedStaffId));
             return {
-                ...rest,
+                ...(isStaffViewer ? withoutClientPayments(rest) : rest),
                 totalPrice: isStaffViewer ? 0 : Number(totalPrice),
                 contact: isStaffViewer
                     ? { name: contactName, email: '', phone: undefined }
@@ -3386,7 +3526,7 @@ async function enrichBookingsForViewer(results: any[], isStaffViewer: boolean) {
                 chatClosedAt: chatClosedAt
                     ? (chatClosedAt instanceof Date ? chatClosedAt.toISOString() : String(chatClosedAt))
                     : null,
-                invoicePaid: Boolean((b as { invoicePaid?: boolean }).invoicePaid),
+                ...(isStaffViewer ? {} : { invoicePaid: Boolean((b as { invoicePaid?: boolean }).invoicePaid) }),
                 /** Deposit or full choice, paid so far and the balance (clients and admin only). */
                 ...(isStaffViewer ? {} : paymentFieldsForViewer(b, depositPct)),
             };
@@ -4228,6 +4368,13 @@ app.patch('/api/bookings/:id', authenticateToken, async (req: any, res) => {
                 );
             } catch (notifyErr) {
                 console.error('[booking update] change notifications failed:', notifyErr);
+            }
+        }
+
+        if (bookingUpdates.status && bookingUpdates.status !== booking.status) {
+            if (bookingUpdates.status === 'Cancelled') await restoreReferralCreditForBooking(db, id);
+            if (bookingUpdates.status === 'Completed') {
+                await unlockReferralForBooking(db, getReferralRewardAmount(await loadBusinessSettingsMap(db)), booking);
             }
         }
 
@@ -5268,7 +5415,7 @@ app.post('/api/staff/:id/invoice', authenticateToken, async (req: any, res) => {
             return res.status(403).json({ error: 'Unauthorized' });
         }
 
-        const { totalAmount, jobs, week, bankDetails, weekTotalHours, weekJobCount, holidayIds } = req.body; // Passed from frontend for simplicity or recalc
+        const { totalAmount, jobs, week, bankDetails, weekTotalHours, weekJobCount, holidayIds, referralRewardIds } = req.body; // Passed from frontend for simplicity or recalc
 
         let holiday: Awaited<ReturnType<typeof holidayInvoiceLines>>;
         try {
@@ -5276,11 +5423,20 @@ app.post('/api/staff/:id/invoice', authenticateToken, async (req: any, res) => {
         } catch (e: any) {
             return res.status(400).json({ error: e?.message || 'Holiday pay could not be added.' });
         }
-        const workJobs = (Array.isArray(jobs) ? jobs : []).filter((j: any) => j?.kind !== 'holiday');
-        if (!workJobs.length && !holiday.lines.length) {
-            return res.status(400).json({ error: 'Add at least one completed job or holiday pay to the invoice.' });
+        let referral: Awaited<ReturnType<typeof referralInvoiceLines>>;
+        try {
+            const [staffForReferral] = await db.select({ userId: staff.userId }).from(staff).where(eq(staff.id, staffId)).limit(1);
+            referral = staffForReferral?.userId
+                ? await referralInvoiceLines(db, Number(staffForReferral.userId), referralRewardIds)
+                : { lines: [], total: 0, ids: [] };
+        } catch (e: any) {
+            return res.status(400).json({ error: e?.message || 'Referral bonuses could not be added.' });
         }
-        const jobList = [...workJobs, ...holiday.lines];
+        const workJobs = (Array.isArray(jobs) ? jobs : []).filter((j: any) => j?.kind !== 'holiday' && j?.kind !== 'referral');
+        if (!workJobs.length && !holiday.lines.length && !referral.lines.length) {
+            return res.status(400).json({ error: 'Add at least one completed job, holiday pay or referral bonus to the invoice.' });
+        }
+        const jobList = [...workJobs, ...holiday.lines, ...referral.lines];
 
         const jobListForEmail = await Promise.all(
             jobList.map(async (j: any) => {
@@ -5299,7 +5455,7 @@ app.post('/api/staff/:id/invoice', authenticateToken, async (req: any, res) => {
             ? weekTotalHours
             : workJobs.reduce((s: number, j: any) => s + (Number(j.yourHours ?? j.hours) || 0), 0)) + holidayHours;
         const jobCount = typeof weekJobCount === 'number' ? weekJobCount : workJobs.length;
-        const invoiceTotal = Number(totalAmount || 0) + holiday.total;
+        const invoiceTotal = Number(totalAmount || 0) + holiday.total + referral.total;
 
         const weekStr = String(week || '');
         const weekParts = weekStr.split(/\s*(?:→|->)\s*|\s+-\s+/);
@@ -5324,6 +5480,9 @@ app.post('/api/staff/:id/invoice', authenticateToken, async (req: any, res) => {
         }).$returningId();
         if (holiday.ids.length && createdInvoice?.id) {
             await markHolidaysClaimed(db, Number(createdInvoice.id), holiday.amounts || {});
+        }
+        if (referral.ids.length && createdInvoice?.id) {
+            await markReferralsClaimed(db, Number(createdInvoice.id), referral.ids);
         }
 
         // Save first: a failed email must never lose the invoice.
@@ -5467,7 +5626,10 @@ app.patch('/api/invoices/:id', authenticateToken, async (req: any, res) => {
         if (status !== undefined) patch.status = String(status);
         if (adminNotes !== undefined) patch.adminNotes = cleanInvoiceNote(adminNotes);
         await db.update(staffInvoices).set(patch).where(eq(staffInvoices.id, id));
-        if (patch.status) await syncHolidayPayForInvoice(db, id, patch.status as 'Pending' | 'Approved' | 'Rejected');
+        if (patch.status) {
+            await syncHolidayPayForInvoice(db, id, patch.status as 'Pending' | 'Approved' | 'Rejected');
+            await syncReferralPayForInvoice(db, id, patch.status as 'Pending' | 'Approved' | 'Rejected');
+        }
 
         const staffIdForInvoice = Number(existing[0].staffId);
         const staffRow = await db.select().from(staff).where(eq(staff.id, staffIdForInvoice)).limit(1);
@@ -5511,6 +5673,7 @@ app.delete('/api/invoices/:id', authenticateToken, async (req: any, res) => {
         if (!existing.length) return res.status(404).json({ error: 'Invoice not found' });
         await db.delete(staffInvoices).where(eq(staffInvoices.id, id));
         await syncHolidayPayForInvoice(db, id, 'Deleted');
+        await syncReferralPayForInvoice(db, id, 'Deleted');
 
         // Let the cleaner know, so they can resubmit a corrected invoice.
         const staffRow = await db.select().from(staff).where(eq(staff.id, Number(existing[0].staffId))).limit(1);
@@ -6942,6 +7105,9 @@ app.patch('/api/bookings/:id/complete', authenticateToken, async (req: any, res)
                 isRead: false
             });
         }
+
+        // The friend's first clean unlocks the reward for whoever referred them.
+        await unlockReferralForBooking(db, getReferralRewardAmount(await loadBusinessSettingsMap(db)), b);
 
         broadcastSync('all');
         res.json(b);

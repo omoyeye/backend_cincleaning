@@ -38,6 +38,8 @@ const COLUMN_MIGRATIONS = [
     'ALTER TABLE `bookings` ADD COLUMN `unassigned_warning_sent_at` TIMESTAMP NULL DEFAULT NULL',
     'ALTER TABLE `users` ADD COLUMN `image_url` TEXT NULL',
     'ALTER TABLE `services` ADD COLUMN `london_rate` DECIMAL(10,2) NULL DEFAULT NULL',
+    // Referral credit a client used on a booking.
+    'ALTER TABLE `bookings` ADD COLUMN `referral_credit_used` DECIMAL(10,2) NULL',
     'ALTER TABLE `bookings` ADD COLUMN `price_region` VARCHAR(20) NULL DEFAULT NULL',
     'ALTER TABLE `bookings` ADD COLUMN `hourly_rate` DECIMAL(10,2) NULL DEFAULT NULL',
     'ALTER TABLE `quote_leads` ADD COLUMN `admin_notes` TEXT NULL',
@@ -145,6 +147,32 @@ const TABLE_MIGRATIONS = [
         PRIMARY KEY (\`id\`),
         KEY \`staff_holidays_staff_year_idx\` (\`staff_id\`, \`holiday_year\`),
         CONSTRAINT \`staff_holidays_staff_id_staff_id_fk\` FOREIGN KEY (\`staff_id\`) REFERENCES \`staff\` (\`id\`) ON DELETE CASCADE
+    )`,
+    `CREATE TABLE IF NOT EXISTS \`referral_rewards\` (
+        \`id\` INT NOT NULL AUTO_INCREMENT,
+        \`referrer_user_id\` INT NOT NULL,
+        \`referred_user_id\` INT NOT NULL,
+        \`amount\` DECIMAL(10,2) NOT NULL,
+        \`status\` VARCHAR(20) NOT NULL DEFAULT 'pending',
+        \`unlocked_at\` TIMESTAMP NULL DEFAULT NULL,
+        \`unlocked_by_booking_id\` INT NULL,
+        \`pay_status\` VARCHAR(20) NOT NULL DEFAULT 'unpaid',
+        \`staff_invoice_id\` INT NULL,
+        \`created_at\` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (\`id\`),
+        UNIQUE KEY \`referral_rewards_referred_unique\` (\`referred_user_id\`),
+        KEY \`referral_rewards_referrer_idx\` (\`referrer_user_id\`)
+    )`,
+    `CREATE TABLE IF NOT EXISTS \`referral_credit_uses\` (
+        \`id\` INT NOT NULL AUTO_INCREMENT,
+        \`user_id\` INT NOT NULL,
+        \`booking_id\` INT NOT NULL,
+        \`amount\` DECIMAL(10,2) NOT NULL,
+        \`status\` VARCHAR(20) NOT NULL DEFAULT 'applied',
+        \`created_at\` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (\`id\`),
+        KEY \`referral_credit_uses_user_idx\` (\`user_id\`),
+        KEY \`referral_credit_uses_booking_idx\` (\`booking_id\`)
     )`,
     `CREATE TABLE IF NOT EXISTS \`broadcasts\` (
         \`id\` INT NOT NULL AUTO_INCREMENT,

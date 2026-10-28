@@ -148,6 +148,8 @@ export const bookings = mysqlTable('bookings', {
     priceRegion: varchar('price_region', { length: 20 }),
     /** Hourly rate actually charged for hourly services, so invoices never depend on today's service rate. */
     hourlyRate: decimal('hourly_rate', { precision: 10, scale: 2 }),
+    /** Referral credit taken off this booking's total (clients only; cleaning credit, no cash value). */
+    referralCreditUsed: decimal('referral_credit_used', { precision: 10, scale: 2 }),
 
     /** When an assigned cleaner tapped "Start travel" for this job. */
     enRouteAt: timestamp('en_route_at'),
@@ -223,6 +225,34 @@ export const staffHolidays = mysqlTable('staff_holidays', {
     staffInvoiceId: int('staff_invoice_id'),
     createdAt: timestamp('created_at').defaultNow(),
     updatedAt: timestamp('updated_at').defaultNow(),
+});
+
+/**
+ * One reward per referred friend. It unlocks when the friend's first clean is completed.
+ * Clients spend unlocked rewards as cleaning credit; staff claim them on their weekly invoice.
+ */
+export const referralRewards = mysqlTable('referral_rewards', {
+    id: int().primaryKey().autoincrement(),
+    referrerUserId: int('referrer_user_id').notNull(),
+    referredUserId: int('referred_user_id').notNull().unique(),
+    amount: decimal('amount', { precision: 10, scale: 2 }).notNull(),
+    status: varchar('status', { length: 20 }).notNull().default('pending'), // pending | available | rejected
+    unlockedAt: timestamp('unlocked_at'),
+    unlockedByBookingId: int('unlocked_by_booking_id'),
+    /** Staff only: unpaid | claimed (on a submitted weekly invoice) | paid (invoice approved) */
+    payStatus: varchar('pay_status', { length: 20 }).notNull().default('unpaid'),
+    staffInvoiceId: int('staff_invoice_id'),
+    createdAt: timestamp('created_at').defaultNow(),
+});
+
+/** Referral credit a client used on a booking; restored if that booking is cancelled. */
+export const referralCreditUses = mysqlTable('referral_credit_uses', {
+    id: int().primaryKey().autoincrement(),
+    userId: int('user_id').notNull(),
+    bookingId: int('booking_id').notNull(),
+    amount: decimal('amount', { precision: 10, scale: 2 }).notNull(),
+    status: varchar('status', { length: 20 }).notNull().default('applied'), // applied | restored
+    createdAt: timestamp('created_at').defaultNow(),
 });
 
 /** Log of admin broadcasts from the Communication hub. */
