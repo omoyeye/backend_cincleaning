@@ -425,6 +425,8 @@ export const staffAssessments = mysqlTable('staff_assessments', {
     quality: int('quality'), // 1-5, optional
     professionalism: int('professionalism'), // 1-5, optional
     remark: text('remark').notNull(),
+    /** Field quality check against the job's task list: [{ task, result: 'pass' | 'fail' | 'na', note? }]. */
+    checklist: json('checklist'),
     createdAt: timestamp('created_at').defaultNow(),
 });
 

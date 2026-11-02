@@ -5,6 +5,8 @@ import { poolConnection } from './db';
  * Runs on server start and before seeding; "duplicate column" errors mean it is already applied.
  */
 const COLUMN_MIGRATIONS = [
+    // Supervisor quality checks scored task by task.
+    'ALTER TABLE `staff_assessments` ADD COLUMN `checklist` JSON NULL',
     'ALTER TABLE `users` ADD COLUMN `marketing_opt_in` BOOLEAN DEFAULT FALSE',
     'ALTER TABLE `bookings` ADD COLUMN `deposit_paid_at` TIMESTAMP NULL DEFAULT NULL',
     'ALTER TABLE `bookings` ADD COLUMN `deposit_paid_amount` DECIMAL(10,2) NULL',

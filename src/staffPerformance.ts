@@ -159,6 +159,7 @@ export function registerStaffPerformanceRoutes(app: Express, db: any, authentica
                 quality: a.quality ?? null,
                 professionalism: a.professionalism ?? null,
                 remark: a.remark,
+                checklist: typeof a.checklist === 'string' ? (() => { try { return JSON.parse(a.checklist as string); } catch { return null; } })() : (a.checklist ?? null),
                 createdAt: a.createdAt ? new Date(a.createdAt).toISOString() : null,
             }));
             const scores = (k: 'rating' | 'punctuality' | 'quality' | 'professionalism') =>

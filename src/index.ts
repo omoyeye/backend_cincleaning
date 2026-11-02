@@ -1,3 +1,4 @@
+import './tz';
 import 'dotenv/config';
 import express from 'express';
 import http from 'http';
@@ -419,11 +420,20 @@ function getBookingStartMs(b: any): number {
     return new Date(year || 1970, (month || 1) - 1, day || 1, hours || 0, minutes || 0).getTime();
 }
 
+/**
+ * Client and cleaner can write to each other from 10 minutes before the start, or earlier once the
+ * job is live: the cleaner is on the way, has sent a running-late notice, or has started work.
+ */
 function isChatOpenForBooking(b: any, hasAssignedStaff: boolean): boolean {
     if (Boolean((b as any).chatClosedByAdmin)) return false;
-    const startMs = getBookingStartMs(b);
-    const unlockMs = startMs - (10 * 60 * 1000);
-    return hasAssignedStaff && Date.now() >= unlockMs;
+    if (!hasAssignedStaff || String(b.status) === 'Cancelled') return false;
+    let lateNotices: unknown = b.lateNotices;
+    if (typeof lateNotices === 'string') {
+        try { lateNotices = JSON.parse(lateNotices); } catch { lateNotices = []; }
+    }
+    if (b.enRouteAt || (Array.isArray(lateNotices) && lateNotices.length > 0) || String(b.status) === 'In Progress') return true;
+    const unlockMs = getBookingStartMs(b) - (10 * 60 * 1000);
+    return Date.now() >= unlockMs;
 }
 
 /** Load one booking by URL segment: numeric PK. */
