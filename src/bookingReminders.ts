@@ -1,4 +1,6 @@
 import { eq, and, inArray, gte, lte, sql } from 'drizzle-orm';
+import { ukYmd } from './tz';
+import { announceNextVisit, assignUsualCleaner, nextVisitInApp } from './regularClients';
 import { bookings, notifications, users, businessSettings, bookingReminderLog, bookingStaff, staff } from './schema';
 import { loadBrandVars } from './messageTemplates/brand';
 import { renderTransactionalEmail } from './messageTemplates/engine';
@@ -398,7 +400,7 @@ function getNextRecurrenceDate(lastDate: string, frequency: string): string {
         case 'Monthly': date.setMonth(date.getMonth() + 1); break;
         default: return '';
     }
-    return date.toISOString().slice(0, 10);
+    return ukYmd(date);
 }
 
 export async function runRecurringBookingCreation(db: any): Promise<{ scanned: number; created: number }> {
@@ -422,6 +424,7 @@ export async function runRecurringBookingCreation(db: any): Promise<{ scanned: n
             contactPhone: bookings.contactPhone,
             propertyDetails: bookings.propertyDetails,
             extras: bookings.extras,
+            assignedStaffId: bookings.assignedStaffId,
         })
         .from(bookings)
         .where(
@@ -441,27 +444,31 @@ export async function runRecurringBookingCreation(db: any): Promise<{ scanned: n
         const nextDate = getNextRecurrenceDate(b.date, frequency);
         if (!nextDate) continue;
 
-        // Check for existing future booking for same customer + service
-        if (b.customerId) {
-            const existing = await db
-                .select({ id: bookings.id })
-                .from(bookings)
-                .where(
-                    and(
-                        eq(bookings.customerId, b.customerId),
-                        eq(bookings.serviceType, b.serviceType),
-                        gte(bookings.date, b.date),
-                        sql`${bookings.status} != 'Cancelled'`,
-                        sql`${bookings.id} != ${b.id}`,
-                    ),
-                )
-                .limit(1);
-            if (existing.length > 0) continue;
-        }
+        // Check for existing future booking for same customer + service (guests are matched by email)
+        const sameClient = b.customerId
+            ? eq(bookings.customerId, b.customerId)
+            : b.contactEmail
+              ? eq(bookings.contactEmail, b.contactEmail)
+              : null;
+        if (!sameClient) continue;
+        const existing = await db
+            .select({ id: bookings.id })
+            .from(bookings)
+            .where(
+                and(
+                    sameClient,
+                    eq(bookings.serviceType, b.serviceType),
+                    gte(bookings.date, b.date),
+                    sql`${bookings.status} != 'Cancelled'`,
+                    sql`${bookings.id} != ${b.id}`,
+                ),
+            )
+            .limit(1);
+        if (existing.length > 0) continue;
 
         const newBookingId = `CIN-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
         try {
-            await db.insert(bookings).values({
+            const [created] = await db.insert(bookings).values({
                 bookingId: newBookingId,
                 customerId: b.customerId || null,
                 serviceType: b.serviceType,
@@ -477,16 +484,14 @@ export async function runRecurringBookingCreation(db: any): Promise<{ scanned: n
                 propertyDetails: b.propertyDetails,
                 extras: b.extras || null,
                 status: 'Pending',
-            });
+            }).$returningId();
 
+            // Same cleaner when they are free, then tell the client (in-app, push and email).
+            const cleanerNames = await assignUsualCleaner(db, Number(created.id), b);
             if (b.customerId) {
-                await db.insert(notifications).values({
-                    userId: Number(b.customerId),
-                    type: 'booking_update',
-                    message: `Your recurring ${b.serviceType} has been scheduled for ${nextDate}. Reference: ${newBookingId}`,
-                    isRead: false,
-                });
+                await nextVisitInApp(db, Number(b.customerId), b.serviceType, nextDate, b.time, newBookingId, cleanerNames);
             }
+            await announceNextVisit(db, Number(created.id), cleanerNames);
 
             createdCount += 1;
         } catch (e) {

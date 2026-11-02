@@ -558,6 +558,91 @@ export const DEFAULT_EMAIL_TEMPLATES: EmailTemplateSeed[] = [
 </p>
 <p>Approve or reject it, then find cover in Job Assignment. <a href="{{admin_url}}" style="color:{{brand_primary}};font-weight:700;">Open the admin dashboard</a></p>`,
   },
+  {
+    name: 'client_regular_welcome',
+    subject: 'Welcome to your regular clean, {{client_name}}',
+    description: 'Sent once when a client books their first weekly, fortnightly or monthly clean.',
+    variables: ['client_name', 'frequency', 'service_type', 'service_date', 'service_time', 'portal_url', 'brand_name', 'brand_primary', 'footer_note'],
+    body: `<p>Hi {{client_name}},</p>
+<p>Thank you for choosing a <strong>{{frequency}}</strong> clean with us. We are really glad to have you as a regular client.</p>
+<p style="margin-top:16px;padding:14px 16px;background:#f8fafc;border-radius:10px;border:1px solid #e2e8f0;">
+  <strong>{{service_type}}</strong><br />
+  First visit: <strong>{{service_date}}</strong> at <strong>{{service_time}}</strong>
+</p>
+<p>What to expect:</p>
+<ul>
+  <li>We book each next visit for you automatically after every clean, and let you know.</li>
+  <li>We keep the same cleaner for you whenever we can.</li>
+  <li>You earn loyalty points on every clean, with thank-you rewards along the way.</li>
+</ul>
+<p>Need to change a date or skip a visit? You can do it from your account, or just reply to this email.</p>
+<div style="text-align:center;margin:28px 0;">
+  <a href="{{portal_url}}" style="display:inline-block;background:{{brand_primary}};color:#ffffff;text-decoration:none;padding:14px 28px;border-radius:12px;font-weight:700;font-size:16px;">View my bookings</a>
+</div>`,
+  },
+  {
+    name: 'client_regular_next_visit',
+    subject: 'Your next clean is booked: {{service_date}} at {{service_time}}',
+    description: 'Sent when the next visit of a regular clean is booked automatically.',
+    variables: ['client_name', 'frequency', 'service_type', 'service_date', 'service_time', 'cleaner_line', 'booking_id', 'portal_url', 'brand_name', 'brand_primary', 'footer_note'],
+    body: `<p>Hi {{client_name}},</p>
+<p>Your next {{frequency}} clean is booked in:</p>
+<p style="margin-top:16px;padding:14px 16px;background:#f8fafc;border-radius:10px;border:1px solid #e2e8f0;">
+  <strong>{{service_type}}</strong> ({{booking_id}})<br />
+  <span style="color:#0f172a;">{{service_date}}</span> at <strong>{{service_time}}</strong><br />
+  <span style="color:#64748b;">{{cleaner_line}}</span>
+</p>
+<p>If that day no longer suits you, you can change it from your account.</p>
+<div style="text-align:center;margin:28px 0;">
+  <a href="{{portal_url}}" style="display:inline-block;background:{{brand_primary}};color:#ffffff;text-decoration:none;padding:14px 28px;border-radius:12px;font-weight:700;font-size:16px;">View booking</a>
+</div>`,
+  },
+  {
+    name: 'client_regular_milestone',
+    subject: 'Thank you for {{clean_count}} cleans with us',
+    description: 'Sent when a regular client reaches a clean milestone (set in Settings > Regular clients).',
+    variables: ['client_name', 'clean_count', 'clean_ordinal', 'reward_line', 'portal_url', 'brand_name', 'brand_primary', 'footer_note'],
+    body: `<p>Hi {{client_name}},</p>
+<p>That was your <strong>{{clean_ordinal}} clean</strong> with {{brand_name}}. Thank you for trusting us with your home.</p>
+<p>{{reward_line}}</p>
+<div style="text-align:center;margin:28px 0;">
+  <a href="{{portal_url}}" style="display:inline-block;background:{{brand_primary}};color:#ffffff;text-decoration:none;padding:14px 28px;border-radius:12px;font-weight:700;font-size:16px;">Book or view my cleans</a>
+</div>`,
+  },
+  {
+    name: 'client_regular_anniversary',
+    subject: 'One year of sparkle, thank you {{client_name}}',
+    description: "Sent on the anniversary of a regular client's first regular clean.",
+    variables: ['client_name', 'years', 'reward_line', 'portal_url', 'brand_name', 'brand_primary', 'footer_note'],
+    body: `<p>Hi {{client_name}},</p>
+<p>It is <strong>{{years}}</strong> since your first regular clean with us. Thank you for being part of the {{brand_name}} family.</p>
+<p>{{reward_line}}</p>
+<div style="text-align:center;margin:28px 0;">
+  <a href="{{portal_url}}" style="display:inline-block;background:{{brand_primary}};color:#ffffff;text-decoration:none;padding:14px 28px;border-radius:12px;font-weight:700;font-size:16px;">View my account</a>
+</div>`,
+  },
+  {
+    name: 'client_regular_winback',
+    subject: 'We miss you, {{client_name}}',
+    description: 'Sent once when a regular client has no upcoming visit for a while.',
+    variables: ['client_name', 'frequency', 'service_type', 'last_booking_date', 'booking_url', 'brand_name', 'brand_primary', 'footer_note'],
+    body: `<p>Hi {{client_name}},</p>
+<p>We noticed your {{frequency}} <strong>{{service_type}}</strong> has paused since <strong>{{last_booking_date}}</strong>. We hope everything is well.</p>
+<p>If anything was not right, just reply and tell us. We would love the chance to put it right.</p>
+<p>Whenever you are ready, picking up where you left off takes a minute:</p>
+<div style="text-align:center;margin:28px 0;">
+  <a href="{{booking_url}}" style="display:inline-block;background:{{brand_primary}};color:#ffffff;text-decoration:none;padding:14px 28px;border-radius:12px;font-weight:700;font-size:16px;">Book my next clean</a>
+</div>`,
+  },
+  {
+    name: 'admin_regular_client_alert',
+    subject: '{{alert_title}}',
+    description: 'Business inbox alerts about regular clients (new, cancelled, at risk, milestones, cleaner needed).',
+    variables: ['alert_title', 'alert_body', 'admin_url', 'brand_name', 'brand_primary', 'footer_note'],
+    body: `<h2 style="margin:0 0 12px;color:#0f172a;font-size:18px;">{{alert_title}}</h2>
+<p>{{alert_body}}</p>
+<p><a href="{{admin_url}}" style="color:{{brand_primary}};font-weight:700;">Open Regular clients in the admin dashboard</a></p>`,
+  },
 ];
 
 export const DEFAULT_SMS_TEMPLATES: SmsTemplateSeed[] = [

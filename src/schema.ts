@@ -586,3 +586,13 @@ export const bookingStaffRelations = relations(bookingStaff, ({ one }) => ({
 export const staffRelations = relations(staff, ({ many }) => ({
     assignments: many(bookingStaff)
 }));
+
+/** Regular client care: one row per welcome, milestone, win-back or admin alert so each goes out once. */
+export const clientCareLog = mysqlTable('client_care_log', {
+    id: int().primaryKey().autoincrement(),
+    customerKey: varchar('customer_key', { length: 190 }).notNull(), // u:<userId> or e:<email>
+    kind: varchar('kind', { length: 40 }).notNull(),
+    ref: varchar('ref', { length: 60 }).notNull().default(''),
+    detail: varchar('detail', { length: 255 }),
+    createdAt: timestamp('created_at').defaultNow(),
+});

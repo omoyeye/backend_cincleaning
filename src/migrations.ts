@@ -77,6 +77,17 @@ const ON_COLUMN_CREATED: Record<string, string[]> = {
 
 /** Tables added after first deploy (created only if missing). */
 const TABLE_MIGRATIONS = [
+    // Regular client care: each welcome, milestone, win-back or alert is sent once.
+    `CREATE TABLE IF NOT EXISTS \`client_care_log\` (
+        \`id\` INT NOT NULL AUTO_INCREMENT,
+        \`customer_key\` VARCHAR(190) NOT NULL,
+        \`kind\` VARCHAR(40) NOT NULL,
+        \`ref\` VARCHAR(60) NOT NULL DEFAULT '',
+        \`detail\` VARCHAR(255) NULL,
+        \`created_at\` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (\`id\`),
+        UNIQUE KEY \`client_care_once\` (\`customer_key\`, \`kind\`, \`ref\`)
+    )`,
     `CREATE TABLE IF NOT EXISTS \`business_reports\` (
         \`id\` INT NOT NULL AUTO_INCREMENT,
         \`kind\` VARCHAR(20) NOT NULL DEFAULT 'weekly',

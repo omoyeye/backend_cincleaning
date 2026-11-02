@@ -1,4 +1,4 @@
-import './tz';
+import { ukYmd } from './tz';
 import 'dotenv/config';
 import express from 'express';
 import http from 'http';
@@ -83,6 +83,7 @@ import {
 } from './notify';
 import { runColumnMigrations } from './migrations';
 import { registerStaffAssessmentRoutes } from './staffAssessments';
+import { onRegularBookingCancelled, onRegularBookingCreated, onRegularCleanCompleted, registerRegularClientRoutes, runRegularClientCare } from './regularClients';
 import { registerBroadcastRoutes } from './broadcasts';
 import { registerStaffHolidayRoutes, holidayInvoiceLines, markHolidaysClaimed, syncHolidayPayForInvoice, MAX_HOLIDAY_DAYS } from './staffHolidays';
 import {
@@ -1376,6 +1377,7 @@ const requireAdmin = (req: any, res: any): boolean => {
 
 registerJobTrackingRoutes(app, db, authenticateToken, requireAdmin);
 registerStaffAssessmentRoutes(app, db, authenticateToken);
+registerRegularClientRoutes(app, db, authenticateToken);
 registerStaffHolidayRoutes(app, db, authenticateToken);
 registerBroadcastRoutes(app, db, authenticateToken, requireAdmin);
 registerStaffPerformanceRoutes(app, db, authenticateToken);
@@ -1776,11 +1778,11 @@ app.get('/api/admin/dashboard-stats', authenticateToken, async (req: any, res) =
     if (!requireAdmin(req, res)) return;
     try {
         const now = new Date();
-        const todayStr = now.toISOString().slice(0, 10);
+        const todayStr = ukYmd(now);
         const thisMonthStart = todayStr.slice(0, 7) + '-01';
         const lastMonthDate = new Date(now.getFullYear(), now.getMonth() - 1, 1);
-        const lastMonthStart = lastMonthDate.toISOString().slice(0, 10).slice(0, 7) + '-01';
-        const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0).toISOString().slice(0, 10);
+        const lastMonthStart = ukYmd(lastMonthDate).slice(0, 7) + '-01';
+        const lastMonthEnd = ukYmd(new Date(now.getFullYear(), now.getMonth(), 0));
         const weekAgo = new Date(now.getTime() - 7 * 86400000).toISOString().slice(0, 10);
 
         // Revenue this month
@@ -1875,7 +1877,7 @@ app.get('/api/admin/dashboard-stats', authenticateToken, async (req: any, res) =
             count: sql`COUNT(*)`
         }).from(bookings).where(
             and(
-                gte(bookings.date, new Date(now.getFullYear(), now.getMonth() - 5, 1).toISOString().slice(0, 10)),
+                gte(bookings.date, ukYmd(new Date(now.getFullYear(), now.getMonth() - 5, 1))),
                 inArray(bookings.status, ['Confirmed', 'Completed'])
             )
         ).groupBy(sql`DATE_FORMAT(date, '%Y-%m')`).orderBy(sql`DATE_FORMAT(date, '%Y-%m')`);
@@ -3393,6 +3395,8 @@ app.post('/api/bookings', async (req, res) => {
             console.error('Booking alert email (admin):', adminMailErr);
         }
 
+        void onRegularBookingCreated(db, numericBookingId);
+
         res.status(201).json({
             id: numericBookingId,
             bookingId: publicBookingId,
@@ -4182,6 +4186,13 @@ app.patch('/api/bookings/:id', authenticateToken, async (req: any, res) => {
         const nextStatus = String(bookingUpdates.status ?? booking.status);
         const isAdminCancel =
             req.user.role === 'admin' && nextStatus === 'Cancelled' && String(booking.status) !== 'Cancelled';
+        // Regular clients: the office hears when a client cancels a regular visit; milestones count completed cleans.
+        if (req.user.role !== 'admin' && nextStatus === 'Cancelled' && String(booking.status) !== 'Cancelled') {
+            void onRegularBookingCancelled(db, booking);
+        }
+        if (nextStatus === 'Completed' && String(booking.status) !== 'Completed') {
+            void onRegularCleanCompleted(db, id);
+        }
         const isAdminReschedule =
             req.user.role === 'admin' &&
             !isAdminCancel &&
@@ -5427,8 +5438,8 @@ app.get('/api/staff/:id/weekly-invoice', authenticateToken, async (req: any, res
         const weekEnd = new Date(weekStart);
         weekEnd.setDate(weekStart.getDate() + 6);
         weekEnd.setHours(23, 59, 59, 999);
-        const weekStartStr = weekStart.toISOString().slice(0, 10);
-        const weekEndStr = weekEnd.toISOString().slice(0, 10);
+        const weekStartStr = ukYmd(weekStart);
+        const weekEndStr = ukYmd(weekEnd);
 
         // 1. Find all completed bookings where this staff was assigned
         const assignments = await db.select().from(bookingStaff).where(eq(bookingStaff.staffId, staffId));
@@ -7191,6 +7202,7 @@ app.patch('/api/bookings/:id/complete', authenticateToken, async (req: any, res)
 
         // The friend's first clean unlocks the reward for whoever referred them.
         await unlockReferralForBooking(db, getReferralRewardAmount(await loadBusinessSettingsMap(db)), b);
+        void onRegularCleanCompleted(db, numericBookingId);
 
         broadcastSync('all');
         res.json(b);
@@ -8121,6 +8133,14 @@ async function startServer() {
                 }
             } catch (err) {
                 console.error('[rebooking nudges]', err);
+            }
+            try {
+                const care = await runRegularClientCare(db);
+                if (care.stuck || care.winBack || care.anniversaries) {
+                    console.log('[regular client care]', care);
+                }
+            } catch (err) {
+                console.error('[regular client care]', err);
             }
         })();
     }, REMINDER_MS);
