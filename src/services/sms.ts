@@ -18,18 +18,20 @@ function normalizeSmsRecipient(raw: string): string | null {
   return `+${s}`;
 }
 
-export async function sendTransactionalSms(toRaw: string, content: string): Promise<void> {
+export type SmsResult = { recipient: string; sender: string; remainingCredits?: number; smsCount?: number } | null;
+
+export async function sendTransactionalSms(toRaw: string, content: string): Promise<SmsResult> {
   const cfg = getBrevoConfig();
   const apiKey = cfg.apiKey;
   const sender = (cfg.smsSender || 'CiNClean').trim();
   const recipient = normalizeSmsRecipient(toRaw);
   if (!recipient) {
     console.warn('[SMS] Skipped: empty or invalid number');
-    return;
+    return null;
   }
   if (!apiKey) {
     console.warn('[SMS] BREVO_API_KEY not set — SMS not sent:', content.slice(0, 80));
-    return;
+    return null;
   }
   const body = {
     sender,
@@ -49,6 +51,10 @@ export async function sendTransactionalSms(toRaw: string, content: string): Prom
   if (!res.ok) {
     const t = await res.text();
     console.error('[SMS] Brevo error', res.status, t);
-    throw new Error(`SMS send failed (${res.status})`);
+    let reason = '';
+    try { reason = String(JSON.parse(t)?.message || ''); } catch { reason = t.slice(0, 200); }
+    throw new Error(`SMS send failed (${res.status})${reason ? `: ${reason}` : ''}`);
   }
+  const data = (await res.json().catch(() => ({}))) as { remainingCredits?: number; smsCount?: number };
+  return { recipient, sender, remainingCredits: data.remainingCredits, smsCount: data.smsCount };
 }

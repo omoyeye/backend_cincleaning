@@ -36,6 +36,7 @@ import {
 } from './schema';
 import { slugify } from './seed/blogGallerySeed';
 import { sendEmail } from './services/email';
+import { sendTransactionalSms } from './services/sms';
 import {
     BREVO_PRIVATE_KEYS,
     clearBrevoConfig,
@@ -6692,6 +6693,24 @@ app.post('/api/admin/brevo-settings/test', authenticateToken, async (req: any, r
     } catch (error: any) {
         console.error('[brevo] test failed', error);
         res.status(500).json({ error: error?.message || 'Brevo test email failed.' });
+    }
+});
+
+/** Admin: send one SMS to check Brevo SMS works (credits, sender name, number format). */
+app.post('/api/admin/brevo-settings/test-sms', authenticateToken, async (req: any, res) => {
+    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin only' });
+    try {
+        const cfg = getBrevoConfig();
+        if (!cfg.apiKey) return res.status(400).json({ error: 'Save a Brevo API key first.' });
+        const to = String(req.body?.to || '').trim();
+        if (!/^\+?[\d\s()-]{7,20}$/.test(to)) return res.status(400).json({ error: 'Enter a mobile number, e.g. 07123 456789.' });
+        const brand = cfg.senderName || 'CiN Cleaning';
+        const sent = await sendTransactionalSms(to, `${brand}: test message from your admin portal. If you can read this, SMS is working.`);
+        if (!sent) return res.status(400).json({ error: 'That number could not be used.' });
+        res.json({ ok: true, ...sent });
+    } catch (error: any) {
+        console.error('[brevo] test sms failed', error);
+        res.status(502).json({ error: error?.message || 'Brevo test SMS failed.' });
     }
 });
 
