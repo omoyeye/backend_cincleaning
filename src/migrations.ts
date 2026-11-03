@@ -5,6 +5,9 @@ import { poolConnection } from './db';
  * Runs on server start and before seeding; "duplicate column" errors mean it is already applied.
  */
 const COLUMN_MIGRATIONS = [
+    // Payment links use a random code, not the booking or invoice number.
+    'ALTER TABLE `bookings` ADD COLUMN `pay_token` VARCHAR(48) NULL',
+    'ALTER TABLE `customer_invoices` ADD COLUMN `pay_token` VARCHAR(48) NULL',
     // Supervisor quality checks scored task by task.
     'ALTER TABLE `staff_assessments` ADD COLUMN `checklist` JSON NULL',
     'ALTER TABLE `users` ADD COLUMN `marketing_opt_in` BOOLEAN DEFAULT FALSE',
@@ -57,6 +60,8 @@ const COLUMN_MIGRATIONS = [
 
 /** One-off data steps that run only when the column they depend on is created for the first time. */
 const ON_COLUMN_CREATED: Record<string, string[]> = {
+    'ALTER TABLE `bookings` ADD COLUMN `pay_token` VARCHAR(48) NULL': ['CREATE UNIQUE INDEX `bookings_pay_token_unique` ON `bookings` (`pay_token`)'],
+    'ALTER TABLE `customer_invoices` ADD COLUMN `pay_token` VARCHAR(48) NULL': ['CREATE UNIQUE INDEX `customer_invoices_pay_token_unique` ON `customer_invoices` (`pay_token`)'],
     // Bookings already paid in full by card (admin full-payment links) count as paid in full.
     'ALTER TABLE `bookings` ADD COLUMN `paid_in_full_at` TIMESTAMP NULL DEFAULT NULL': [
         `UPDATE \`bookings\` SET \`paid_in_full_at\` = \`deposit_paid_at\`

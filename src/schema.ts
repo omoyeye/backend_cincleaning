@@ -130,6 +130,8 @@ export const bookings = mysqlTable('bookings', {
     invoicePaid: boolean('invoice_paid').notNull().default(false),
     adminNotes: text('admin_notes'),
     stripePaymentLink: text('stripe_payment_link'),
+    /** Random code in the public payment link (never the booking number). */
+    payToken: varchar('pay_token', { length: 48 }),
     stripePaymentIntentId: varchar('stripe_booking_payment_intent_id', { length: 255 }),
     /** When the automatic 48h-before-job reminder was sent (email/SMS/in-app). */
     reminder48SentAt: timestamp('reminder_48h_sent_at'),
@@ -408,6 +410,8 @@ export const customerInvoices = mysqlTable('customer_invoices', {
     sentVia: varchar('sent_via', { length: 20 }),
     stripePaymentIntentId: varchar('stripe_payment_intent_id', { length: 255 }),
     stripePaymentUrl: varchar('stripe_payment_url', { length: 500 }),
+    /** Random code in the public payment link (never the invoice number). */
+    payToken: varchar('pay_token', { length: 48 }),
     createdBy: int('created_by'),
     createdAt: timestamp('created_at').defaultNow(),
     updatedAt: timestamp('updated_at').defaultNow(),

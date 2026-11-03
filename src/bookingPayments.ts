@@ -1,4 +1,5 @@
 import { and, eq, gte, sql } from 'drizzle-orm';
+import { bookingPayUrl, findBookingByPayToken } from './payLinks';
 import type Stripe from 'stripe';
 import { bookings } from './schema';
 import { loadBusinessSettingsMap, loadBrandVars } from './messageTemplates/brand';
@@ -203,7 +204,7 @@ export async function sendBalanceRequest(db: any, b: any, depositPercent: number
     const s = paymentSummary(b, depositPercent);
     if (s.stage !== 'deposit_paid' || s.balanceDue < 0.01) return false;
     const ref = String(b.bookingId ?? b.id);
-    const payUrl = siteUrl(`/pay/booking/${b.id}`);
+    const payUrl = await bookingPayUrl(db, b);
     const brand = await loadBrandVars(db);
     const vars = {
         client_name: String(b.contactName || 'there'),
@@ -267,9 +268,9 @@ export function registerBookingPaymentRoutes(
 ): void {
     const { db, stripe, authenticateToken, publicBaseUrlFromRequest } = deps;
 
-    const loadBooking = async (raw: string) => {
-        const id = parseInt(raw, 10);
-        if (!Number.isFinite(id)) return null;
+    // Public pay pages find the booking by its random pay code only, never by number.
+    const loadBooking = (key: string) => findBookingByPayToken(db, key);
+    const reloadBooking = async (id: number) => {
         const rows = await db.select().from(bookings).where(eq(bookings.id, id)).limit(1);
         return rows[0] || null;
     };
@@ -303,7 +304,7 @@ export function registerBookingPaymentRoutes(
                     }
                 }
             }
-            b = (await loadBooking(String(b.id))) || b;
+            b = (await reloadBooking(Number(b.id))) || b;
             const s = paymentSummary(b, pct);
 
             if (s.stage === 'paid') return res.json({ ...base, paid: true, total: s.total, amountPaid: s.amountPaid });
@@ -316,7 +317,7 @@ export function registerBookingPaymentRoutes(
                 return res.json({ ...base, stage: 'balance', clientSecret: pi.client_secret, amount: s.balanceDue, total: s.total, amountPaid: s.amountPaid });
             }
 
-            const payUrl = `${publicBaseUrlFromRequest(req)}/pay/booking/${b.id}`;
+            const payUrl = await bookingPayUrl(db, b);
             const amount = firstChargeAmount(s.total, pct, s.choice);
             const pi = await ensureFirstIntent(deps, b, amount, s.choice, payUrl);
             if (!pi) return res.status(400).json({ error: 'No payment set up for this booking' });
@@ -347,7 +348,7 @@ export function registerBookingPaymentRoutes(
             const choice = normalizeChoice(req.body?.choice);
             await db.update(bookings).set({ paymentChoice: choice } as any).where(eq(bookings.id, b.id));
             const amount = firstChargeAmount(s.total, pct, choice);
-            const payUrl = `${publicBaseUrlFromRequest(req)}/pay/booking/${b.id}`;
+            const payUrl = await bookingPayUrl(db, b);
             const pi = await ensureFirstIntent(deps, { ...b, paymentChoice: choice }, amount, choice, payUrl);
             res.json({ choice, amount, clientSecret: pi?.client_secret || null });
         } catch (e: any) {

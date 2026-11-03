@@ -83,6 +83,7 @@ import {
     adminUserIds as listAdminUserIds,
 } from './notify';
 import { runColumnMigrations } from './migrations';
+import { bookingPayUrl, findInvoiceByPayToken, invoicePayUrl, isPayToken, upgradeLegacyPayLinks } from './payLinks';
 import { registerStaffAssessmentRoutes } from './staffAssessments';
 import { onRegularBookingCancelled, onRegularBookingCreated, onRegularCleanCompleted, registerRegularClientRoutes, runRegularClientCare } from './regularClients';
 import { registerBroadcastRoutes } from './broadcasts';
@@ -3331,7 +3332,7 @@ app.post('/api/bookings', async (req, res) => {
                         description: `${choice === 'full' ? 'Full payment' : `Deposit (${depositPercent}%)`} — Booking ${publicBookingId} — ${bookingData.contact?.name || 'Guest'}`,
                         receipt_email: contactEmail || undefined,
                     });
-                    const payUrl = `${publicBaseUrlFromRequest(req)}/pay/booking/${numericBookingId}`;
+                    const payUrl = await bookingPayUrl(db, { id: numericBookingId });
                     stripePaymentLinkForResponse = payUrl;
                     await db.update(bookings).set({
                         stripePaymentIntentId: pi.id,
@@ -4783,7 +4784,7 @@ app.post('/api/bookings/:id/create-payment-intent', authenticateToken, async (re
             receipt_email: bRow.contactEmail || undefined,
         });
 
-        const payUrl = `${publicBaseUrlFromRequest(req)}/pay/booking/${bRow.id}`;
+        const payUrl = await bookingPayUrl(db, bRow);
         await db.update(bookings).set({
             stripePaymentIntentId: pi.id,
             stripePaymentLink: payUrl,
@@ -6231,7 +6232,7 @@ app.post('/api/customer-invoices/:id/create-payment-intent', authenticateToken, 
             receipt_email: inv.customerEmail || undefined,
         });
 
-        const payUrl = `${publicBaseUrlFromRequest(req)}/pay/invoice/${inv.id}`;
+        const payUrl = await invoicePayUrl(db, inv);
         await db.update(customerInvoices).set({
             stripePaymentIntentId: pi.id,
             stripePaymentUrl: payUrl,
@@ -6246,11 +6247,10 @@ app.post('/api/customer-invoices/:id/create-payment-intent', authenticateToken, 
 
 app.get('/api/pay/invoice/:id', async (req, res) => {
     try {
-        const id = parseInt(req.params.id, 10);
-        if (Number.isNaN(id)) return res.status(400).json({ error: 'Invalid id' });
-        const rows = await db.select().from(customerInvoices).where(eq(customerInvoices.id, id)).limit(1);
-        if (!rows.length) return res.status(404).json({ error: 'Invoice not found' });
-        const inv = rows[0];
+        // Found by the random pay code in the link only, never by invoice number.
+        const inv = await findInvoiceByPayToken(db, req.params.id);
+        if (!inv) return res.status(404).json({ error: 'Invoice not found' });
+        const id = Number(inv.id);
 
         if (inv.status === 'paid') return res.json({ paid: true, invoiceNumber: inv.invoiceNumber });
         if (!inv.stripePaymentIntentId || !stripe) return res.status(400).json({ error: 'No payment set up for this invoice' });
@@ -7084,7 +7084,7 @@ app.post('/api/admin/email-templates/preview', authenticateToken, async (req: an
         const subject = String(req.body?.subject || '');
         const brand = await loadBrandVars(db);
         const site = brand.brand_website_url || 'https://www.cleanitneatly.com';
-        const vars: Record<string, string> = { ...EMAIL_PREVIEW_SAMPLES, pay_url: `${site}/pay/booking/1`, portal_url: `${site}/my-account`, ...brand };
+        const vars: Record<string, string> = { ...EMAIL_PREVIEW_SAMPLES, pay_url: `${site}/pay/booking/Xk3q9fT2bW7nLp4sYv8aRm1c`, portal_url: `${site}/my-account`, ...brand };
         const fill = (str: string) =>
             str.replace(/\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g, (_m, k: string) => (vars[k] != null ? String(vars[k]) : `[${k}]`));
         let html: string;
@@ -7671,8 +7671,9 @@ app.get('/sitemap-style.xsl', (_req, res) => {
 // ── Standalone payment page for customer invoice ──
 app.get('/pay/invoice/:id', async (req, res) => {
     const publishableKey = process.env.STRIPE_PUBLISHABLE_KEY || '';
-    const id = parseInt(req.params.id, 10);
-    if (Number.isNaN(id) || !publishableKey) return res.status(400).send('Invalid request');
+    // The link carries a random pay code (safe characters only), not a number.
+    const id = String(req.params.id || '');
+    if (!isPayToken(id) || !publishableKey) return res.status(404).send('This payment link is not valid. Please use the latest link from your email or your account.');
 
     let brandName = 'CiN Cleaning';
     let brandPrimary = '#7c3aed';
@@ -7777,8 +7778,9 @@ button:disabled{opacity:.5;cursor:not-allowed}
 // ── Standalone payment page for booking deposit ──
 app.get('/pay/booking/:id', async (req, res) => {
     const publishableKey = process.env.STRIPE_PUBLISHABLE_KEY || '';
-    const id = parseInt(req.params.id, 10);
-    if (Number.isNaN(id) || !publishableKey) return res.status(400).send('Invalid request');
+    // The link carries a random pay code (safe characters only), not a number.
+    const id = String(req.params.id || '');
+    if (!isPayToken(id) || !publishableKey) return res.status(404).send('This payment link is not valid. Please use the latest link from your email or your account.');
 
     let brandName = 'CiN Cleaning';
     let brandPrimary = '#7c3aed';
@@ -8064,6 +8066,12 @@ async function startServer() {
         await loadBrevoConfigFromDb(db);
 
         await runColumnMigrations();
+        try {
+            const upgraded = await upgradeLegacyPayLinks(db);
+            if (upgraded) console.log(`[pay links] ${upgraded} saved payment links now use a random code`);
+        } catch (e) {
+            console.error('[pay links] upgrade failed', e);
+        }
 
         // The first-time-visitor popup advertises FIRST10, so the code must exist.
         try {
